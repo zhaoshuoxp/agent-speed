@@ -1,3 +1,5 @@
+> **Custom macOS fork:** SSH usage controls and the separate maintenance app are built by this fork. Download the custom packages from [Actions](https://github.com/zhaoshuoxp/agent-speed/actions/workflows/sync-upstream.yml) and read the [custom build guide](docs/CUSTOM-FORK.md). The upstream installer documented below installs the upstream distribution.
+
 <div align="center">
 
 <img src="assets/icon/icon-1024.png" width="128" alt="Agent Speed 图标">
