@@ -1,24 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#28b9be"/><stop offset="0.52" stop-color="#127a9d"/>
-      <stop offset="1" stop-color="#154572"/>
+      <stop offset="0" stop-color="#163c61"/><stop offset="1" stop-color="#081c35"/>
     </linearGradient>
-    <linearGradient id="front" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#dbf1f2"/>
+    <linearGradient id="shell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#cce9ef"/>
+    </linearGradient>
+    <linearGradient id="badge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb347"/><stop offset="1" stop-color="#f27624"/>
     </linearGradient>
   </defs>
   <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#background)"/>
-  <rect x="50" y="50" width="924" height="924" rx="206" fill="none" stroke="#ffffff" stroke-opacity="0.14" stroke-width="4"/>
-  <path d="M352 222h320a62 62 0 0 1 62 62v144a62 62 0 0 1-62 62H474l-99 65v-65h-23a62 62 0 0 1-62-62V284a62 62 0 0 1 62-62z" fill="#e5faf8"/>
-  <path d="M365 310h294M365 383h206" fill="none" stroke="#177891" stroke-width="34" stroke-linecap="round"/>
-  <rect x="254" y="514" width="516" height="280" rx="62" fill="#0e4e75" fill-opacity="0.24"/>
-  <rect x="254" y="490" width="516" height="280" rx="62" fill="url(#front)"/>
-  <rect x="222" y="460" width="580" height="102" rx="34" fill="#ffffff"/>
-  <path d="M278 566h468" stroke="#a5d7df" stroke-width="7" stroke-linecap="round"/>
-  <path d="M382 650h260" fill="none" stroke="#197b95" stroke-width="25" stroke-linecap="round"/>
-  <circle cx="382" cy="650" r="25" fill="#197b95"/>
-  <circle cx="512" cy="650" r="31" fill="#197b95"/>
-  <circle cx="642" cy="650" r="25" fill="#197b95"/>
-  <path d="M470 713h84" stroke="#197b95" stroke-width="18" stroke-linecap="round" opacity="0.6"/>
+  <rect x="51" y="51" width="922" height="922" rx="205" fill="none" stroke="#88dcea" stroke-opacity="0.16" stroke-width="6"/>
+  <path d="M174 400h65m-65 132h65m498-132h65m-65 132h65M340 665v71m132-71v71" fill="none" stroke="#4bd8df" stroke-width="34" stroke-linecap="round"/>
+  <path d="M476 208v69" stroke="#bce9ee" stroke-width="28" stroke-linecap="round"/>
+  <circle cx="476" cy="195" r="34" fill="#50e1e7"/>
+  <rect x="218" y="271" width="522" height="404" rx="103" fill="#020f24" fill-opacity="0.35" transform="translate(0 16)"/>
+  <rect x="218" y="263" width="522" height="404" rx="103" fill="url(#shell)"/>
+  <rect x="270" y="326" width="418" height="258" rx="65" fill="#102f4b"/>
+  <rect x="337" y="393" width="57" height="83" rx="28" fill="#55e6ec"/>
+  <rect x="558" y="393" width="57" height="83" rx="28" fill="#55e6ec"/>
+  <path d="M431 528h90" fill="none" stroke="#8deff1" stroke-width="21" stroke-linecap="round"/>
+  <path d="M307 619h100" stroke="#8eabb8" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="654" cy="619" r="11" fill="#1ca7bb"/>
+  <path d="M793 162l17 47 47 17-47 17-17 47-17-47-47-17 47-17z" fill="#6fe6ef"/>
+  <circle cx="729" cy="743" r="181" fill="#081a30"/>
+  <circle cx="729" cy="733" r="169" fill="url(#badge)"/>
+  <path d="M779 595c-45-7-81 30-72 73L595 780c-13 13-13 34 0 47s34 13 47 0l112-112c43 9 80-27 73-72l-39 39-47-47z" fill="#ffffff"/>
+  <circle cx="619" cy="803" r="12" fill="#f58b2e"/>
 </svg>

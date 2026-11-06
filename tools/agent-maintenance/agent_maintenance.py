@@ -18,7 +18,7 @@ import sys
 import time
 import zipfile
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 ENGINE = Path(__file__).with_name("host.py")
 SSH_OPTIONS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
                "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no", "-o", "ControlMaster=no",
@@ -91,7 +91,15 @@ def host_configuration():
     values = [item["host"] if isinstance(item, dict) else item for item in values]
     if not all(isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item) for item in values):
         raise ValueError("Configured hosts must be literal SSH aliases")
-    return {"hosts": list(dict.fromkeys(["local", *values])), "host_source": source,
+    hosts = list(dict.fromkeys(["local", *values]))
+    settings = read_configuration()
+    profile = Path(__file__).with_name("config.example.json")
+    defaults = json.loads(profile.read_text()) if profile.is_file() else {}
+    preferred = settings.get("upgrade_hosts", defaults.get("upgrade_hosts", []))
+    upgrade_hosts = [value for value in preferred if value in hosts and value != "local"]
+    if not upgrade_hosts and "upgrade_hosts" not in settings:
+        upgrade_hosts = [value for value in hosts if value != "local"]
+    return {"hosts": hosts, "host_source": source, "upgrade_hosts": upgrade_hosts,
             "discovered_ssh_hosts": ssh_hosts(), "configuration_path": str(configuration_path())}
 
 
@@ -101,7 +109,8 @@ def configured_hosts():
 
 def configure(args):
     settings = read_configuration()
-    changed = args.hosts is not None or args.auto_hosts or args.codex_home is not None or args.claude_home is not None
+    changed = (args.hosts is not None or args.auto_hosts or args.codex_home is not None
+               or args.claude_home is not None or args.upgrade_hosts is not None)
     if args.auto_hosts:
         settings.pop("hosts", None)
     elif args.hosts is not None:
@@ -109,6 +118,11 @@ def configure(args):
         if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) for value in values):
             raise ValueError("Use literal SSH aliases separated by commas or newlines")
         settings["hosts"] = list(dict.fromkeys(values))
+    if args.upgrade_hosts is not None:
+        values = [value for value in re.split(r"[,\s]+", args.upgrade_hosts) if value and value != "local"]
+        if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) for value in values):
+            raise ValueError("Upgrade targets must be literal SSH aliases")
+        settings["upgrade_hosts"] = list(dict.fromkeys(values))
     roots = settings.setdefault("data_roots", {})
     for key, value in (("codex", args.codex_home), ("claude", args.claude_home)):
         if value is not None:
@@ -339,6 +353,7 @@ def parser():
     group.add_argument("--auto-hosts", action="store_true", help="Restore automatic host discovery")
     child.add_argument("--codex-home", help="Local Codex data directory; empty restores automatic selection")
     child.add_argument("--claude-home", help="Local Claude data directory; empty restores automatic selection")
+    child.add_argument("--upgrade-hosts", help="Preferred SSH servers for CLI checks and upgrades")
     child = commands.add_parser("diagnose", help="Report data roots and record counts without conversation content")
     common(child)
     child = commands.add_parser("interactive", help="Browse and maintain conversations interactively")
@@ -363,7 +378,7 @@ def parser():
     common(child)
     selection_arguments(child)
     child.add_argument("operation", choices=("archive", "unarchive", "delete", "cleanup"))
-    child.add_argument("--backup", type=Path, help="Verified backup; required for archive and delete")
+    child.add_argument("--backup", type=Path, help="Verified backup for archive; not required for delete")
     child.add_argument("--category", choices=("logs", "temp"), action="append")
     child.add_argument("--older-than", type=int, default=30, metavar="DAYS")
     child.add_argument("--output", type=Path, required=True)
@@ -379,6 +394,11 @@ def parser():
 
 
 def host_names(args):
+    if args.command == "upgrade" and not args.host:
+        targets = host_configuration()["upgrade_hosts"]
+        if not targets:
+            raise ValueError("No SSH upgrade targets configured. Choose --host explicitly or configure remote servers.")
+        return targets
     values = args.host or ["all"]
     return list(dict.fromkeys(host for value in values for host in (configured_hosts() if value == "all" else [value])))
 
@@ -428,7 +448,7 @@ def interactive(args):
                 main(["backup", *base, *scope, "--output", str(Path(destination).expanduser())])
             continue
         proof = []
-        if operation in ("archive", "delete"):
+        if operation == "archive":
             backup = input("Existing verified backup ZIP path: ").strip()
             proof = ["--backup", str(Path(backup).expanduser())]
         directory = Path.home() / ".local/state/agent-maintenance/plans"
@@ -472,7 +492,7 @@ def output_result(value, args):
         print(f"Conversations: {len(plan['sessions'])}; files: {len(plan['items'])}; size: {size(plan['bytes'])}")
         for row in plan["sessions"]:
             print(f"  {row['tool']} {row['id']}  {row['title'][:90]}")
-        print("Archive preserves transcript size. Delete requires the verified backup.")
+        print("Archive preserves transcript size. Manage any deletion backups separately.")
         print("Plan saved: " + str(args.output.resolve()))
         print("Apply: agent-maintenance apply " + shlex.quote(str(args.output.resolve())) + " --confirm " + plan["plan_id"])
     else:
@@ -482,8 +502,8 @@ def output_result(value, args):
 def main(argv=None):
     os.umask(0o077)
     args = parser().parse_args(argv)
-    hosts = host_names(args)
     try:
+        hosts = host_names(args) if args.command not in ("config", "hosts", "verify", "restore-files", "apply") else ["local"]
         if args.command == "hosts":
             result = host_configuration()
         elif args.command == "config":
@@ -535,7 +555,7 @@ def main(argv=None):
         elif args.command == "plan":
             if len(hosts) != 1:
                 raise ValueError("Select one --host for each reviewed maintenance plan")
-            proof = verify_backup(args.backup) if args.backup else None
+            proof = verify_backup(args.backup) if args.backup and args.operation == "archive" else None
             request = {"action": "plan", "operation": args.operation, "selector": selector(args),
                        "categories": args.category, "days": args.older_than}
             if proof:
@@ -552,7 +572,7 @@ def main(argv=None):
                 raise ValueError("Unsupported maintenance plan")
             plan = wrapper["plan"]
             request = {"action": "apply", "plan": plan, "confirm": args.confirm}
-            if plan.get("backup_path"):
+            if plan["operation"] == "archive" and plan.get("backup_path"):
                 proof = verify_backup(Path(plan["backup_path"]))
                 if proof["sha256"] != plan["backup_sha256"]:
                     raise ValueError("The reviewed backup changed")

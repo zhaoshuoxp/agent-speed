@@ -19,7 +19,7 @@ with zipfile.ZipFile(args.app_zip) as archive:
     if archive.testzip():
         raise SystemExit("The signed app archive is corrupt")
     info = plistlib.loads(archive.read("Agent Maintenance.app/Contents/Info.plist"))
-    for name in ("host.py", "agent_maintenance.py", "find-python.sh", "README.txt"):
+    for name in ("host.py", "agent_maintenance.py", "find-python.sh", "README.txt", "config.example.json"):
         if archive.read("Agent Maintenance.app/Contents/Resources/CLI/" + name) != (source / name).read_bytes():
             raise SystemExit("Rebuild the app before packaging: its bundled CLI differs from " + name)
 version = info["CFBundleShortVersionString"]
@@ -34,7 +34,7 @@ cli = folder / "cli"
 cli.mkdir()
 files = ["agent_maintenance.py", "host.py", "agent-maintenance", "find-python.sh", "install.py",
          "install_legacy.py", "legacy_codex_archives.py", "legacy_claude_sessions.py",
-         "legacy_codex_update_server.sh", "README.txt", "test_maintenance.py", "validate_native_codex.py",
+         "legacy_codex_update_server.sh", "README.txt", "config.example.json", "test_maintenance.py", "validate_native_codex.py",
          "desktop/AgentMaintenance.swift", "desktop/build-app.sh", "desktop/verify-app.py",
          "desktop/assets/AgentMaintenance.svg", "desktop/assets/AgentMaintenance.icns",
          "desktop/assets/GenerateIcon.swift", "desktop/assets/icon-1024.png"]

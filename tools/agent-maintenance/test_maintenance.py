@@ -173,7 +173,7 @@ class MaintenanceTests(unittest.TestCase):
         client.restore_files(proof["path"], restored)
         self.assertEqual((restored / entry["name"]).read_bytes(), self.payloads[PARENT].read_bytes())
 
-    def test_claude_backup_archive_restore_and_delete_require_verified_content(self):
+    def test_claude_archive_requires_backup_and_delete_uses_manual_backups(self):
         proof = self.make_backup({"sessions": [CLAUDE], "tool": "claude"})
         request = {"operation": "archive", "selector": {"sessions": [CLAUDE], "tool": "claude"},
                    "backup_sha256": proof["sha256"], "backup_path": proof["path"], "backup_proof": proof["manifest"]}
@@ -184,16 +184,16 @@ class MaintenanceTests(unittest.TestCase):
         self.assertTrue((self.archived / "projects/example" / (CLAUDE + ".jsonl")).exists())
         plan = host.make_plan({"operation": "unarchive", "selector": {"sessions": [CLAUDE], "tool": "claude"}})
         self.assertTrue(host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})["all_verified"])
-        request["operation"] = "delete"
-        plan = host.make_plan(request)
-        self.assertTrue(host.apply_plan({"plan": plan, "confirm": plan["plan_id"], "verified_backup_sha256": proof["sha256"]})["all_verified"])
+        plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CLAUDE], "tool": "claude"}})
+        self.assertIsNone(plan["backup_sha256"])
+        self.assertTrue(host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})["all_verified"])
         self.assertFalse(self.claude_path.exists())
         self.assertFalse(self.tool_output.exists())
         self.assertTrue(Path(proof["path"]).exists())
 
     def test_stale_backup_and_unbacked_children_are_rejected(self):
         proof = self.make_backup({"sessions": [PARENT], "tool": "codex"})
-        request = {"operation": "delete", "selector": {"sessions": [PARENT], "tool": "codex"},
+        request = {"operation": "archive", "selector": {"sessions": [PARENT], "tool": "codex"},
                    "backup_sha256": proof["sha256"], "backup_path": proof["path"], "backup_proof": proof["manifest"]}
         request["backup_proof"] = {**proof["manifest"], "sessions": [row for row in proof["manifest"]["sessions"] if row["id"] != CHILD]}
         with self.assertRaises(ValueError):
@@ -206,15 +206,51 @@ class MaintenanceTests(unittest.TestCase):
             host.make_plan(request)
 
     def test_changed_files_and_wrong_confirmation_cannot_apply(self):
-        proof = self.make_backup({"sessions": [CLAUDE], "tool": "claude"})
-        plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CLAUDE]},
-                               "backup_proof": proof["manifest"], "backup_sha256": proof["sha256"]})
+        plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CLAUDE]}})
         with self.assertRaises(ValueError):
-            host.apply_plan({"plan": plan, "confirm": "wrong", "verified_backup_sha256": proof["sha256"]})
+            host.apply_plan({"plan": plan, "confirm": "wrong"})
         self.claude_path.write_text("changed")
         with self.assertRaises(RuntimeError):
-            host.apply_plan({"plan": plan, "confirm": plan["plan_id"], "verified_backup_sha256": proof["sha256"]})
+            host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})
         self.assertTrue(self.claude_path.exists())
+
+    def test_codex_metadata_only_record_is_deleted_through_native_cli(self):
+        self.payloads[CHILD].unlink()
+        plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CHILD], "tool": "codex"}})
+        self.assertEqual(plan["items"], [])
+
+        def native_delete(arguments, **kwargs):
+            self.assertEqual(arguments, ["/fixture/codex", "delete", CHILD, "--force"])
+            self.assertEqual(kwargs["env"]["CODEX_HOME"], str(self.codex))
+            with contextlib.closing(sqlite3.connect(self.database)) as database:
+                database.execute("delete from threads where id=?", (CHILD,))
+                database.commit()
+            return subprocess.CompletedProcess(arguments, 0, stdout="Deleted", stderr="")
+
+        with mock.patch.object(host, "find_cli", return_value="/fixture/codex"), \
+                mock.patch.object(host.subprocess, "run", side_effect=native_delete) as run:
+            result = host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})
+        run.assert_called_once()
+        self.assertTrue(result["all_verified"])
+
+    def test_codex_delete_reports_remaining_metadata_as_needing_review(self):
+        self.payloads[CHILD].unlink()
+        plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CHILD], "tool": "codex"}})
+        response = subprocess.CompletedProcess([], 0, stdout="Deleted", stderr="")
+        with mock.patch.object(host, "find_cli", return_value="/fixture/codex"), \
+                mock.patch.object(host.subprocess, "run", return_value=response):
+            result = host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})
+        self.assertFalse(result["all_verified"])
+        self.assertEqual(result["results"][0]["state"], "needs_review")
+
+    def test_gui_cli_discovery_handles_a_minimal_path(self):
+        binary = self.base / ".local/bin/codex"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        with mock.patch.object(host.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"AGENT_MAINTENANCE_CODEX_BIN": ""}):
+            self.assertEqual(host.find_cli("codex"), str(binary))
 
     def test_recent_conversation_is_protected(self):
         os.utime(self.payloads[PARENT], None)
@@ -257,7 +293,7 @@ class MaintenanceTests(unittest.TestCase):
         plan_path = self.base / "delete-plan.json"
         with contextlib.redirect_stdout(io.StringIO()):
             status = client.main(["plan", "delete", "--host", "local", "--tool", "claude", "--session", CLAUDE,
-                                  "--backup", str(destination), "--output", str(plan_path), "--json"])
+                                  "--output", str(plan_path), "--json"])
         self.assertEqual(status, 0)
         plan = json.loads(plan_path.read_text())
         with contextlib.redirect_stdout(io.StringIO()):
@@ -265,6 +301,68 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertFalse(self.claude_path.exists())
         self.assertTrue(destination.exists())
+
+    def test_upgrades_default_to_preferred_servers_and_can_explicitly_target_local(self):
+        aliases = "thor,loki,freya,bordeaux,champagne,zoran"
+        response = {"tools": []}
+        with mock.patch.dict(os.environ, {"AGENT_MAINTENANCE_HOSTS": aliases}), \
+                mock.patch.object(client, "invoke", return_value=response) as invoke, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(client.main(["upgrade", "--json"]), 0)
+            self.assertEqual({call.args[0] for call in invoke.call_args_list}, set(aliases.split(",")) - {"zoran"})
+            invoke.reset_mock()
+            self.assertEqual(client.main(["upgrade", "--host", "local", "--tool", "codex", "--json"]), 0)
+            self.assertEqual(invoke.call_args.args[:2], ("local", {"action": "versions", "tool": "codex",
+                                                                "check_latest": True, "apply": False}))
+
+    def test_empty_saved_upgrade_targets_do_not_fall_back_to_local(self):
+        path = client.configuration_path()
+        path.parent.mkdir()
+        path.write_text('{"hosts":["thor"],"upgrade_hosts":[]}')
+        output = io.StringIO()
+        with mock.patch.object(client, "invoke") as invoke, contextlib.redirect_stdout(output):
+            self.assertEqual(client.main(["upgrade", "--json"]), 1)
+        invoke.assert_not_called()
+        self.assertIn("No SSH upgrade targets", json.loads(output.getvalue())["error"])
+
+    def test_upgrade_selection_is_saved_without_changing_source_hosts(self):
+        path = client.configuration_path()
+        path.parent.mkdir()
+        path.write_text('{"hosts":["thor","loki"]}')
+        args = client.parser().parse_args(["config", "--upgrade-hosts", "loki"])
+        result = client.configure(args)
+        self.assertEqual(result["hosts"], ["local", "thor", "loki"])
+        self.assertEqual(result["upgrade_hosts"], ["loki"])
+        self.assertEqual(json.loads(path.read_text())["upgrade_hosts"], ["loki"])
+
+    def test_native_upgrade_skips_newer_versions_and_rechecks_updated_version(self):
+        def response(value):
+            return subprocess.CompletedProcess([], 0, stdout=value, stderr="")
+
+        with mock.patch.object(host, "find_cli", return_value="/fixture/codex"), \
+                mock.patch.object(host, "latest_version", return_value="0.166.0"), \
+                mock.patch.object(host.subprocess, "run", return_value=response("codex-cli 0.167.0")) as run:
+            result = host.tool_versions({"tool": "codex", "apply": True})["tools"][0]
+        self.assertEqual(result["state"], "installed")
+        self.assertFalse(result["update_available"])
+        run.assert_called_once()
+        sequence = [response("codex-cli 0.165.0"), response("Updated"), response("codex-cli 0.166.0")]
+        with mock.patch.object(host, "find_cli", return_value="/fixture/codex"), \
+                mock.patch.object(host, "latest_version", return_value="0.166.0"), \
+                mock.patch.object(host.subprocess, "run", side_effect=sequence) as run:
+            result = host.tool_versions({"tool": "codex", "apply": True})["tools"][0]
+        self.assertEqual(run.call_args_list[1].args[0], ["/fixture/codex", "update"])
+        self.assertEqual(result["state"], "updated")
+        self.assertEqual(result["installed"], "0.166.0")
+
+    def test_bundled_codex_cli_is_found_but_not_self_updated(self):
+        response = subprocess.CompletedProcess([], 0, stdout="codex-cli 0.165.0", stderr="")
+        with mock.patch.object(host, "find_cli", return_value="/Applications/Codex.app/Contents/Resources/codex"), \
+                mock.patch.object(host, "latest_version", return_value="0.166.0"), \
+                mock.patch.object(host.subprocess, "run", return_value=response) as run:
+            result = host.tool_versions({"tool": "codex", "apply": True})["tools"][0]
+        self.assertEqual(result["state"], "app_managed")
+        run.assert_called_once()
 
     def test_upgrade_error_is_reported_with_a_nonzero_exit_code(self):
         result = {"tools": [{"tool": "codex", "state": "error", "error": "Release channel unavailable"}]}

@@ -1,3 +1,4 @@
 {
-  "hosts": ["thor", "loki", "freya", "bordeaux", "champagne"]
+  "hosts": ["thor", "loki", "freya", "bordeaux", "champagne"],
+  "upgrade_hosts": ["thor", "loki", "freya", "bordeaux", "champagne"]
 }

@@ -1,4 +1,4 @@
-Agent Maintenance 0.1.1 - Test Distribution
+Agent Maintenance 0.1.2 - Test Distribution
 
 INSTALL ON MACOS
 Quit older copies of Agent Maintenance, extract this complete ZIP, and double-click Install.command. You can also run bash Install.command from Terminal. The installer creates ~/Applications/Agent Maintenance.app and ~/.local/bin/agent-maintenance. Open that exact app path when several copies exist.
@@ -12,17 +12,20 @@ CHECK THE INSTALLATION
   ~/.local/bin/agent-maintenance hosts --json
   ~/.local/bin/agent-maintenance diagnose --host local --json
 
-Version output should be 0.1.1. A previous installation that stopped at the Python check did not create the CLI launcher; run this updated installer to create it.
+Version output should be 0.1.2. A previous installation that stopped at the Python check did not create the CLI launcher; run this updated installer to create it.
 
 SSH HOSTS
 Literal Host aliases are discovered from ~/.ssh/config and its Include files. Wildcard and negated patterns are excluded. Existing Agent Speed SSHUsage settings and explicit maintenance host selections take precedence. Select Sources & SSH in the app to review detected hosts, choose aliases, and save the selection. The new computer needs working SSH aliases and key or ssh-agent authentication; background requests cannot display password prompts. This package contains no private keys, login credentials, live SSH configuration, or conversation data.
 
-config.example.json contains the five example aliases thor, loki, freya, bordeaux, and champagne. Importing it is optional because the app can discover and configure hosts directly.
+config.example.json contains the five example aliases thor, loki, freya, bordeaux, and champagne. Importing it is optional because the app can discover and configure hosts directly. These five aliases are preferred CLI upgrade targets when present. Open Remote CLI maintenance to check both CLIs on the selected servers, choose targets and tools, save the selection, or apply native upgrades. CLI targets are independent of the conversation host. Select This computer explicitly for local checks.
+
+CODEX QR-PAIRED REMOTE
+The independent maintenance app cannot reuse Codex desktop's QR-paired Remote channel. Install and run the CLI on the paired device through its Codex Remote chat; --host local then refers to that device. The maintenance app displays the app computer and record host to identify where operations run.
 
 CODEX RECORDS
 The source summary shows actual data homes and record counts. Local Codex defaults to ~/.codex. Guardian records whose parent conversation is absent remain visible. Include subagents shows every record, and the Kind column identifies subagents. A store containing guardian records only is labeled explicitly. Sources & SSH also allows choosing another local Codex or Claude data home.
 
-Start testing with browsing and backups. Archive/delete require a verified backup and a reviewed plan. restore-files extracts standalone originals and database row exports; native desktop sidebar import from a deleted-conversation backup is not implemented. The source Mac remained locked during development, so visual UI acceptance is still pending. The packaged app passed a non-UI runtime check using Python 3.9 and an isolated 40-guardian fixture.
+Start testing with browsing and backups. Delete requests a final confirmation and uses your manual backup policy; no backup chooser or backup verification is required. Archive requires a verified backup and a reviewed plan. restore-files extracts standalone originals and database row exports; native desktop sidebar import from a deleted-conversation backup is not implemented. The source Mac remained locked during development, so visual UI acceptance is still pending. The packaged app is checked through its native runtime using Python 3.9 and an isolated 40-guardian fixture.
 
 CLI ON MACOS OR LINUX
   python3 cli/install.py

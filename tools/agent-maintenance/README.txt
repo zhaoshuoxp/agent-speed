@@ -1,4 +1,4 @@
-Agent Maintenance 0.1.1
+Agent Maintenance 0.1.2
 
 DESKTOP APP
 The separate Agent Maintenance macOS app uses this same CLI. It lists local and SSH hosts, filters conversations by project/tool/archive state, backs up selected conversations or a project, previews archive/unarchive/delete and log/temp cleanup, verifies and restores standalone backups, and checks or applies CLI upgrades. Conversation changes and cleanup show a reviewed plan before confirmation. CLI upgrades require explicit confirmation. Build a universal app with desktop/build-app.sh OUTPUT_DIRECTORY using a compatible SDK or complete Xcode installation. Python 3 must be available on the Mac and remote hosts. No traffic monitor is installed.
@@ -34,11 +34,11 @@ ARCHIVE, RESTORE ARCHIVED, OR DELETE
   agent-maintenance plan archive --host my-server --session CONVERSATION_UUID --backup conversation.zip --output archive-plan.json
   agent-maintenance apply archive-plan.json --confirm FULL_PLAN_ID
   agent-maintenance plan unarchive --host my-server --session CONVERSATION_UUID --output restore-plan.json
-  agent-maintenance plan delete --host my-server --project /absolute/project/path --backup project.zip --output delete-plan.json
+  agent-maintenance plan delete --host my-server --project /absolute/project/path --output delete-plan.json
 
-Review the plan before running the printed apply command. Archive and delete require a current verified backup covering every selected conversation and descendant. The exact backup is reverified when applying; altered, active, stale, or expired plans are refused. Plans expire after 24 hours. Broad selection requires explicit --all. No files are removed during a plan.
+Review the plan before running the printed apply command. Delete uses manual backups: it neither asks for nor verifies a backup file. The desktop app shows the selected host, conversations, descendants, and size before a final Delete confirmation. Archive requires a current verified backup covering every selected conversation and descendant, and reverifies it when applying. Altered, active, stale, or expired plans are refused. Plans expire after 24 hours. Broad selection requires explicit --all. No files are removed during a plan.
 
-Codex operations use the installed CLI's native archive, unarchive, and delete commands. Claude archives move complete conversation bundles to ~/.claude-archive/projects, and unarchive moves them back. Archives retain transcript bytes; deleting after a verified backup releases those transcript files. SQLite databases may retain allocated pages, and package runtimes remain installed. Agent Speed daily usage history is independent of source conversation deletion. Its synchronizer removes indexed orphan hard links when the local original has gone.
+Codex operations use the installed CLI's native archive, unarchive, and delete commands. On macOS, CLI discovery also checks standard installation paths and desktop app bundles when Finder provides a minimal PATH. Deletion of a metadata-only record still invokes the native CLI; success requires the record to disappear from inventory. Claude archives move complete conversation bundles to ~/.claude-archive/projects, and unarchive moves them back. Archives retain transcript bytes; deleting releases those transcript files. SQLite databases may retain allocated pages, and package runtimes remain installed. Agent Speed daily usage history is independent of source conversation deletion. Its synchronizer removes indexed orphan hard links when the local original has gone.
 
 LOGS AND TEMPORARY FILES
   agent-maintenance plan cleanup --host my-server --category logs --category temp --older-than 30 --output cleanup-plan.json
@@ -47,11 +47,20 @@ LOGS AND TEMPORARY FILES
 Cleanup only considers known log/cache/temp directories and rechecks every file against the current whitelist. It excludes conversation transcripts, databases, credentials, configuration, and installed CLI runtimes. Use inspect to distinguish large sessions, history databases, generated media, logs, and installed runtime releases. Database compaction and runtime release deletion are not performed.
 
 CLI UPGRADES
-  agent-maintenance upgrade --host all
-  agent-maintenance upgrade --host all --tool codex --apply
-  agent-maintenance upgrade --host all --tool claude --apply
+  agent-maintenance upgrade
+  agent-maintenance upgrade --tool codex --apply
+  agent-maintenance upgrade --tool claude --apply
+  agent-maintenance config --upgrade-hosts thor,loki,freya,bordeaux,champagne
+  agent-maintenance upgrade --host local --tool codex
 
-Checks compare semantic versions against official release channels. Applying delegates to codex update or claude update. No upgrade is performed without --apply. Every host result is reported; failures produce a nonzero exit code. --json is available for desktop clients and automation.
+The desktop Remote CLI maintenance panel has independent server checkboxes and a Codex/Claude selector. It defaults to selected SSH servers, regardless of the conversation host, and shows installed/latest versions and per-host errors. The selected servers can be saved. This computer and the conversation host are explicit alternate targets.
+
+Without --host, upgrade targets the saved upgrade_hosts list. The bundled profile prefers thor, loki, freya, bordeaux, and champagne among discovered aliases; otherwise configured remote hosts are selected. An explicitly empty list requires choosing targets. Use --host local to check or update the computer running the command.
+
+SSH runs use a login shell and ~/.local/bin, following the legacy server updater. Checks compare semantic versions against official release channels. Applying delegates to codex update or claude update, skips installed versions at or above the channel version, and verifies the resulting version. Missing CLIs are reported without installation. Desktop-bundled CLIs are updated with their owning desktop app. No upgrade is performed without --apply. Every host result is reported; failures produce a nonzero exit code. --json is available for desktop clients and automation.
+
+CODEX REMOTE PAIRING
+Codex desktop's QR-paired Remote channel is not integrated into this independent app. Its paired device is not automatically an SSH target. Install the maintenance CLI on that device and execute it from a Codex Remote chat on the device; use --host local to manage that device's files. In the desktop maintenance app, App computer identifies the computer running the app, and Record host identifies the selected data source. Direct QR-channel management would require a separate supported transport integration.
 
 VALIDATION
   python3 -m unittest -v test_maintenance.py

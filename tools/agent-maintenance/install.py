@@ -23,7 +23,7 @@ if prefix.exists():
     prefix.rename(prefix.with_name(prefix.name + ".backup-" + stamp))
 prefix.mkdir(parents=True, mode=0o700)
 source = Path(__file__).resolve().parent
-for name in ("agent_maintenance.py", "host.py", "README.txt", "find-python.sh"):
+for name in ("agent_maintenance.py", "host.py", "README.txt", "find-python.sh", "config.example.json"):
     shutil.copyfile(source / name, prefix / name)
     (prefix / name).chmod(0o600)
 binary.parent.mkdir(parents=True, exist_ok=True)

@@ -22,7 +22,7 @@ import zipfile
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 RECENT_SECONDS = 300
 
@@ -296,6 +296,21 @@ def machine_id():
     return hashlib.sha256((os.uname().nodename + "\0" + str(Path.home().resolve())).encode()).hexdigest()[:24]
 
 
+def find_cli(tool):
+    override = os.environ.get("AGENT_MAINTENANCE_" + tool.upper() + "_BIN")
+    candidates = [override, shutil.which(tool), str(Path.home() / ".local/bin" / tool),
+                  str(Path.home() / "bin" / tool), "/opt/homebrew/bin/" + tool, "/usr/local/bin/" + tool]
+    if tool == "claude":
+        candidates.append(str(Path.home() / ".claude/local/claude"))
+    if tool == "codex" and sys.platform == "darwin":
+        for base in (Path.home() / "Applications", Path("/Applications")):
+            for app in ("ChatGPT.app", "Codex.app"):
+                resources = base / app / "Contents/Resources"
+                candidates += [str(resources / "codex-cli/bin/codex"), str(resources / "codex"),
+                               str(resources / "codex-cli/CodexCLI.app/Contents/MacOS/codex")]
+    return next((path for path in candidates if path and Path(path).is_file() and os.access(path, os.X_OK)), None)
+
+
 def inventory(include_storage=False):
     codex, errors = scan_codex()
     claude, more = scan_claude()
@@ -324,7 +339,7 @@ def inventory(include_storage=False):
 
 def diagnostics(data):
     locations = roots()
-    result = {"home": str(Path.home()), "errors": data["errors"]}
+    result = {"home": str(Path.home()), "hostname": data["hostname"], "errors": data["errors"]}
     for tool in ("codex", "claude"):
         rows = [row for row in data["sessions"] if row["tool"] == tool]
         visible = selected_sessions(data, {"tool": tool}, expand=False)
@@ -616,7 +631,7 @@ def make_plan(request):
             raise RuntimeError("Selected conversations are active or recently changed: " + ", ".join(active))
         proof = request.get("backup_proof") or {}
         covered = {(item["tool"], item["id"]) for item in proof.get("sessions", [])}
-        if operation in ("archive", "delete"):
+        if operation == "archive":
             if not result["backup_sha256"] or not all((row["tool"], row["id"]) in covered for row in rows):
                 raise ValueError("A verified backup covering every selected conversation and child is required")
         backed_hashes = {}
@@ -627,10 +642,10 @@ def make_plan(request):
             result["sessions"].append(row)
             for path in session_files(row):
                 value = fingerprint(path)
-                digest = file_hash(path)
+                digest = file_hash(path) if operation == "archive" else None
                 if fingerprint(path) != value:
                     raise RuntimeError("A session file changed while preparing the plan")
-                if operation in ("archive", "delete") and digest not in backed_hashes.get((row["tool"], row["id"]), set()):
+                if operation == "archive" and digest not in backed_hashes.get((row["tool"], row["id"]), set()):
                     raise ValueError("The backup is missing a file or predates its current content: " + str(path))
                 result["items"].append({"path": str(path), "tool": row["tool"], "owner_id": row["id"],
                                         "sha256": digest, **identity(path)})
@@ -664,7 +679,7 @@ def apply_plan(request):
         for item in plan["items"]:
             Path(item["path"]).unlink()
         return {"operation": operation, "removed_files": len(plan["items"]), "bytes": plan["bytes"]}
-    if operation in ("archive", "delete") and request.get("verified_backup_sha256") != plan.get("backup_sha256"):
+    if operation == "archive" and request.get("verified_backup_sha256") != plan.get("backup_sha256"):
         raise ValueError("Reverify the exact backup before applying this plan")
     current = inventory()
     by_id = {(row["tool"], row["id"]): row for row in current["sessions"]}
@@ -679,15 +694,15 @@ def apply_plan(request):
             if row.get("database"):
                 with contextlib.closing(connect(row["database"])) as db:
                     state = db.execute("select archived,rollout_path from threads where id=?", (row["id"],)).fetchone()
-                if operation == "delete" and (not state or not Path(state[1]).exists()):
+                if operation == "delete" and not state:
                     results.append({"tool": "codex", "id": row["id"], "state": "applied"})
                     continue
                 if operation in ("archive", "unarchive") and state and bool(state[0]) == (operation == "archive"):
                     results.append({"tool": "codex", "id": row["id"], "state": "applied"})
                     continue
-            executable = shutil.which("codex")
+            executable = find_cli("codex")
             if not executable:
-                raise RuntimeError("Codex CLI is unavailable")
+                raise RuntimeError("Codex CLI is unavailable on this host. Install it there or set AGENT_MAINTENANCE_CODEX_BIN.")
             arguments = [executable, operation, row["id"]]
             if operation == "delete":
                 arguments.append("--force")
@@ -719,7 +734,7 @@ def apply_plan(request):
         if result["state"] != "applied":
             continue
         actual = remaining.get((result["tool"], result["id"]))
-        valid = (not actual or not Path(actual["path"]).exists()) if operation == "delete" else actual and actual["archived"] == (operation == "archive")
+        valid = not actual if operation == "delete" else actual and actual["archived"] == (operation == "archive")
         result["state"] = "verified" if valid else "needs_review"
     return {"operation": operation, "results": results,
             "all_verified": all(item["state"] == "verified" for item in results),
@@ -790,7 +805,7 @@ def tool_versions(request):
     for tool in ("codex", "claude") if request.get("tool", "all") == "all" else (request["tool"],):
         if tool not in ("codex", "claude"):
             raise ValueError("Unsupported CLI")
-        item = {"tool": tool, "path": shutil.which(tool), "state": "missing"}
+        item = {"tool": tool, "path": find_cli(tool), "state": "missing"}
         result.append(item)
         if not item["path"]:
             continue
@@ -800,19 +815,30 @@ def tool_versions(request):
             if not match:
                 raise ValueError("Could not parse the installed version")
             item.update(installed=match.group(0), state="installed")
+            bundled = ".app/Contents/" in item["path"]
+            item["managed_by"] = "desktop app" if bundled else "native CLI"
             if request.get("check_latest") or request.get("apply"):
                 item["latest"] = latest_version(tool)
                 item["update_available"] = version_key(item["installed"]) < version_key(item["latest"])
-            if request.get("apply") and item["update_available"]:
+            if request.get("apply") and item["update_available"] and bundled:
+                item.update(state="app_managed", note="Update the desktop app to update this bundled CLI.")
+            elif request.get("apply") and item["update_available"]:
                 response = subprocess.run([item["path"], "update"], stdin=subprocess.DEVNULL, capture_output=True,
                                           text=True, timeout=900, check=True)
+                update_output = (response.stdout or "") + (response.stderr or "")
+                item["update_log"] = update_output[-6000:]
+                if tool == "codex" and "Could not safely inspect old Codex releases" in update_output:
+                    item["note"] = "The CLI update succeeded; old releases were retained because cleanup inspection was unavailable."
                 actual = subprocess.run([item["path"], "--version"], capture_output=True, text=True, timeout=20, check=True)
                 match = re.search(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", actual.stdout)
                 if not match or version_key(match.group(0)) < version_key(item["latest"]):
                     raise RuntimeError("The updated CLI did not pass version verification")
-                item.update(installed=match.group(0), state="updated")
+                item.update(installed=match.group(0), state="updated", update_available=False)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            item.update(state="error", error=str(error))
+            detail = ""
+            if isinstance(error, subprocess.CalledProcessError):
+                detail = (error.stderr or error.stdout or "")[-2000:]
+            item.update(state="error", error=str(error) + (": " + detail if detail else ""))
     return {"tools": result}
 
 

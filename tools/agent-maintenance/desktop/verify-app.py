@@ -55,11 +55,15 @@ with tempfile.TemporaryDirectory(prefix="maintenance-app-check-") as temporary:
         raise RuntimeError(response.stderr[-4000:])
     report = json.loads(response.stdout)
     assert report["hosts"] == ["local", "thor", "loki", "freya", "bordeaux", "champagne"], report
+    targets = ["thor", "loki", "freya", "bordeaux", "champagne"]
+    assert report["upgrade_hosts"] == targets, report
+    assert report["upgrade_arguments"] == ["upgrade", "--tool", "all"] + [argument for name in targets for argument in ("--host", name)], report
+    assert report["execution_host"], report
     assert report["codex"]["total_records"] == 40, report
     assert report["codex"]["visible_records"] == 27, report
     assert report["codex"]["subagent_records"] == 40, report
     assert report["claude"]["total_records"] == 1, report
     assert report["iconBundled"], report
     print(json.dumps({"app_version": info["CFBundleShortVersionString"], "python": report["python"],
-                      "hosts": len(report["hosts"]), "codex_records": 40, "default_visible_codex": 27,
+                      "hosts": len(report["hosts"]), "upgrade_targets": len(targets), "codex_records": 40, "default_visible_codex": 27,
                       "claude_records": 1, "icon_bundled": True, "signature": "passed", "self_check": "passed"}, indent=2))

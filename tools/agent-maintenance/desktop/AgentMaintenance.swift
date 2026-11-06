@@ -34,8 +34,27 @@ private struct CLIError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct CLIUpgradeRequest {
+    let hosts: [String]
+    let tool: String
+    func arguments(apply: Bool) throws -> [String] {
+        guard !hosts.isEmpty else { throw CLIError(message: "Select at least one CLI target first.") }
+        return ["upgrade", "--tool", tool] + hosts.flatMap { ["--host", $0] } + (apply ? ["--apply"] : [])
+    }
+}
+
+struct CLIVersionRow: Identifiable {
+    let host: String
+    let tool: String
+    let installed: String
+    let latest: String
+    let state: String
+    let detail: String
+    var id: String { host + ":" + tool }
+}
+
 private enum CLI {
-    static func execute(_ arguments: [String]) throws -> [String: Any] {
+    static func execute(_ arguments: [String], allowPartialResults: Bool = false) throws -> [String: Any] {
         guard let root = Bundle.main.resourceURL?.appendingPathComponent("CLI") else {
             throw CLIError(message: "The bundled maintenance CLI is missing.")
         }
@@ -71,6 +90,7 @@ private enum CLI {
             throw CLIError(message: String(data: diagnostics, encoding: .utf8) ?? "The CLI returned no structured result.")
         }
         if process.terminationStatus != 0 {
+            if allowPartialResults, object["hosts"] != nil { return object }
             let message = object["error"] as? String ?? String(data: data, encoding: .utf8) ?? "Maintenance failed."
             throw CLIError(message: message)
         }
@@ -104,9 +124,19 @@ final class MaintenanceModel: ObservableObject {
     @Published var sourceSummary = "Loading data sources"
     @Published var sourceDetail = ""
     @Published var scanNotice = ""
+    @Published var executionHost = "This computer"
+    @Published var showCLIs = false
+    @Published var upgradeServers = Set<String>()
+    @Published var cliScope = "servers"
+    @Published var cliTool = "all"
+    @Published var cliRows: [CLIVersionRow] = []
+    @Published var cliSummary = "Choose targets, then check installed versions."
+    @Published var cliConfirmation = false
+    @Published var cliConfirmationText = ""
+    private var confirmedUpgrade: CLIUpgradeRequest?
     private var pendingPlan: URL?
     private var pendingID: String?
-    private var pendingUpgrade = false
+    private var pendingOperation = ""
 
     var visible: [Conversation] {
         conversations.filter { row in
@@ -148,6 +178,7 @@ final class MaintenanceModel: ObservableObject {
         hosts = value["hosts"] as? [String] ?? ["local"]
         if !hosts.contains(host) { host = "local" }
         discoveredHosts = value["discovered_ssh_hosts"] as? [String] ?? []
+        upgradeServers = Set(value["upgrade_hosts"] as? [String] ?? hosts.filter { $0 != "local" })
         autoHosts = !(value["explicit_hosts"] as? Bool ?? false)
         hostDraft = hosts.filter { $0 != "local" }.joined(separator: "\n")
         let roots = value["configured_data_roots"] as? [String: String] ?? [:]
@@ -160,8 +191,10 @@ final class MaintenanceModel: ObservableObject {
         let claude = value["claude"] as? [String: Any] ?? [:]
         let codexCount = codex["total_records"] as? Int ?? 0
         let claudeCount = claude["total_records"] as? Int ?? 0
+        let recordHost = value["hostname"] as? String ?? host
+        if host == "local" { executionHost = recordHost }
         sourceSummary = "Codex: \(codexCount) records  ·  Claude: \(claudeCount) records"
-        sourceDetail = "Codex: \(codex["root"] as? String ?? "Unknown")\nClaude: \(claude["root"] as? String ?? "Unknown")"
+        sourceDetail = "App computer: \(executionHost)  ·  Record host: \(recordHost)\nCodex: \(codex["root"] as? String ?? "Unknown")\nClaude: \(claude["root"] as? String ?? "Unknown")"
         let errors = value["errors"] as? [[String: Any]] ?? []
         if !errors.isEmpty {
             scanNotice = errors.compactMap { $0["error"] as? String }.joined(separator: "; ")
@@ -184,6 +217,7 @@ final class MaintenanceModel: ObservableObject {
     func saveSources() {
         var arguments = ["config", "--codex-home", codexDraft, "--claude-home", claudeDraft]
         arguments += autoHosts ? ["--auto-hosts"] : ["--hosts", hostDraft]
+        arguments += ["--upgrade-hosts", upgradeServers.sorted().joined(separator: ",")]
         run(arguments, label: "Saving source settings") { result in
             self.readConfiguration(result)
             self.showSources = false
@@ -200,13 +234,14 @@ final class MaintenanceModel: ObservableObject {
             if codex { codexDraft = path } else { claudeDraft = path }
         }
     }
-    private func run(_ arguments: [String], label: String, completed: (([String: Any]) -> Void)? = nil) {
+    private func run(_ arguments: [String], label: String, allowPartialResults: Bool = false,
+                     completed: (([String: Any]) -> Void)? = nil) {
         guard !busy else { return }
         busy = true
         status = label
         Task {
             let result = await Task.detached(priority: .utility) { () -> Result<[String: Any], Error> in
-                Result { try CLI.execute(arguments) }
+                Result { try CLI.execute(arguments, allowPartialResults: allowPartialResults) }
             }.value
             busy = false
             switch result {
@@ -253,7 +288,7 @@ final class MaintenanceModel: ObservableObject {
             guard let selected = scope() else { return }
             arguments += selected
         }
-        if operation == "archive" || operation == "delete" {
+        if operation == "archive" {
             guard let backup = chooseBackup() else { return }
             arguments += ["--backup", backup.path]
         }
@@ -266,31 +301,86 @@ final class MaintenanceModel: ObservableObject {
             guard let plan = result["plan"] as? [String: Any], let identifier = plan["plan_id"] as? String else { return }
             self.pendingPlan = path
             self.pendingID = identifier
-            self.pendingUpgrade = false
+            self.pendingOperation = operation
             let sessions = plan["sessions"] as? [[String: Any]] ?? []
             let items = plan["items"] as? [[String: Any]] ?? []
             let bytes = (plan["bytes"] as? NSNumber)?.int64Value ?? 0
             let titles = sessions.prefix(8).compactMap { $0["title"] as? String }.joined(separator: "\n")
-            self.confirmationText = "\(operation.capitalized) on \(self.host): \(sessions.count) conversations, \(items.count) files, \(Self.size(bytes)).\n\n\(titles)\n\nPlan: \(path.path)\n\nArchive retains transcript size. Delete removes the originals after rechecking the verified backup."
+            let note = operation == "delete"
+                ? "Delete permanently removes these conversations and their descendants. Manage any backups separately; no backup is checked by this action."
+                : "Archive retains transcript size."
+            self.confirmationText = "\(operation.capitalized) on \(self.host): \(sessions.count) records including descendants, \(items.count) files, \(Self.size(bytes)).\n\n\(titles)\n\n\(note)"
             self.confirmation = true
         }
     }
     func applyConfirmed() {
-        if pendingUpgrade {
-            run(["upgrade", "--host", host, "--tool", tool, "--apply"], label: "Updating native CLIs")
-        } else if let plan = pendingPlan, let identifier = pendingID {
+        if let plan = pendingPlan, let identifier = pendingID {
             run(["apply", plan.path, "--confirm", identifier], label: "Applying reviewed plan") { _ in self.refresh() }
         }
         pendingPlan = nil
         pendingID = nil
-        pendingUpgrade = false
+        pendingOperation = ""
     }
+    var confirmationTitle: String { pendingOperation == "delete" ? "Delete selected conversations?" : "Apply maintenance action?" }
+    var confirmationAction: String { pendingOperation == "delete" ? "Delete" : "Apply" }
     func inspect() { run(["inspect", "--host", host], label: "Measuring storage") }
-    func versions() { run(["upgrade", "--host", host, "--tool", tool], label: "Checking CLI versions") }
+    var cliTargets: [String] {
+        switch cliScope {
+        case "computer": return ["local"]
+        case "conversation": return [host]
+        default: return hosts.filter { $0 != "local" && upgradeServers.contains($0) }
+        }
+    }
+    func openCLIs() {
+        showCLIs = true
+        versions()
+    }
+    func versions() {
+        executeCLIRequest(CLIUpgradeRequest(hosts: cliTargets, tool: cliTool), apply: false)
+    }
+    private func executeCLIRequest(_ request: CLIUpgradeRequest, apply: Bool) {
+        do {
+            let arguments = try request.arguments(apply: apply)
+            run(arguments, label: apply ? "Updating target CLIs" : "Checking target CLI versions", allowPartialResults: true) { value in
+                self.cliRows = []
+                for machine in value["hosts"] as? [[String: Any]] ?? [] {
+                    let name = machine["host"] as? String ?? "Unknown"
+                    for entry in machine["tools"] as? [[String: Any]] ?? [] {
+                        let raw = entry["state"] as? String ?? "Unknown"
+                        let state = raw == "installed" ? ((entry["update_available"] as? Bool ?? false) ? "Update available" : "Up to date") : raw
+                        self.cliRows.append(CLIVersionRow(host: name, tool: entry["tool"] as? String ?? "",
+                            installed: entry["installed"] as? String ?? "—", latest: entry["latest"] as? String ?? "—",
+                            state: state, detail: entry["error"] as? String ?? entry["note"] as? String ?? entry["path"] as? String ?? ""))
+                    }
+                }
+                let failures = value["failures"] as? [[String: Any]] ?? []
+                for failure in failures where failure["tool"] == nil {
+                    self.cliRows.append(CLIVersionRow(host: failure["host"] as? String ?? "Unknown", tool: request.tool,
+                        installed: "—", latest: "—", state: "Connection error", detail: failure["error"] as? String ?? ""))
+                }
+                self.cliSummary = "\(request.hosts.count) targets checked; \(failures.count) errors. " + (apply ? "Native update results are shown below." : "No upgrade was performed.")
+            }
+        } catch {
+            cliSummary = error.localizedDescription
+        }
+    }
     func upgrade() {
-        pendingUpgrade = true
-        confirmationText = "Run the native CLI updater for \(tool) on \(host)? This installs available updates through the official CLI update command."
-        confirmation = true
+        let request = CLIUpgradeRequest(hosts: cliTargets, tool: cliTool)
+        guard !request.hosts.isEmpty else { cliSummary = "Select at least one CLI target first."; return }
+        confirmedUpgrade = request
+        cliConfirmationText = "Update \(cliTool) using each target's native CLI updater?\n\nTargets: \(request.hosts.joined(separator: ", "))\n\nVersions at or above the release channel are skipped. No CLI is installed on targets where it is missing."
+        cliConfirmation = true
+    }
+    func applyCLIUpgrade() {
+        guard let request = confirmedUpgrade else { return }
+        executeCLIRequest(request, apply: true)
+        confirmedUpgrade = nil
+    }
+    func saveUpgradeTargets() {
+        run(["config", "--upgrade-hosts", upgradeServers.sorted().joined(separator: ",")], label: "Saving CLI targets") { value in
+            self.readConfiguration(value)
+            self.cliSummary = "CLI target selection saved."
+        }
     }
     func verifyOrRestore(restore: Bool) {
         guard let backup = chooseBackup() else { return }
@@ -367,12 +457,12 @@ struct MaintenanceView: View {
                 Stepper("Logs and temp older than \(model.cleanupDays) days", value: $model.cleanupDays, in: 1...3650).frame(width: 310)
                 Button("Preview cleanup") { model.plan("cleanup") }
                 Spacer()
-                Button("Check CLI versions", action: model.versions)
-                Button("Upgrade CLIs", action: model.upgrade)
+                Text("CLI targets: \(model.upgradeServers.count) SSH servers").font(.caption).foregroundStyle(.secondary)
+                Button("Remote CLI maintenance", action: model.openCLIs)
             }
             TextEditor(text: .constant(model.report)).font(.system(.caption, design: .monospaced))
                 .frame(minHeight: 100, idealHeight: 150, maxHeight: 200).border(Color.secondary.opacity(0.2))
-            Text("Backups preserve original files and media. Restore files extracts a standalone copy; native sidebar import is not performed.")
+            Text("Delete uses your manual backup policy and does not request a backup file. Restore files extracts a standalone copy.")
                 .font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(18).frame(minWidth: 1040, minHeight: 700)
@@ -380,11 +470,78 @@ struct MaintenanceView: View {
         .onChange(of: model.host) { model.refresh() }
         .onChange(of: model.includeSubagents) { model.refresh() }
         .sheet(isPresented: $model.showSources) { SourceSettingsView(model: model) }
-        .alert("Apply this maintenance action?", isPresented: $model.confirmation) {
+        .sheet(isPresented: $model.showCLIs) { CLIMaintenanceView(model: model) }
+        .alert(model.confirmationTitle, isPresented: $model.confirmation) {
             Button("Cancel", role: .cancel) {}
-            Button("Apply", action: model.applyConfirmed)
+            if model.confirmationAction == "Delete" {
+                Button("Delete", role: .destructive, action: model.applyConfirmed)
+            } else {
+                Button("Apply", action: model.applyConfirmed)
+            }
         } message: { Text(model.confirmationText) }
         .task { model.start() }
+    }
+}
+
+private struct CLIMaintenanceView: View {
+    @ObservedObject var model: MaintenanceModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Remote CLI maintenance").font(.title2.weight(.semibold))
+                Spacer()
+                Text("App computer: " + model.executionHost).font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                Picker("Targets", selection: $model.cliScope) {
+                    Text("Selected SSH servers").tag("servers")
+                    Text("Conversation host: " + model.host).tag("conversation")
+                    Text("This computer").tag("computer")
+                }.frame(width: 360)
+                Picker("CLIs", selection: $model.cliTool) {
+                    Text("Codex + Claude").tag("all")
+                    Text("Codex").tag("codex")
+                    Text("Claude").tag("claude")
+                }.frame(width: 240)
+            }
+            if model.cliScope == "servers" {
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], alignment: .leading) {
+                    ForEach(model.hosts.filter { $0 != "local" }, id: \.self) { name in
+                        Toggle(name, isOn: Binding(get: { model.upgradeServers.contains(name) }, set: { enabled in
+                            if enabled { model.upgradeServers.insert(name) } else { model.upgradeServers.remove(name) }
+                        })).toggleStyle(.checkbox)
+                    }
+                }
+                Button("Save server selection", action: model.saveUpgradeTargets)
+            }
+            Text("Targets: " + (model.cliTargets.isEmpty ? "None selected" : model.cliTargets.joined(separator: ", ")))
+                .font(.callout.weight(.medium)).textSelection(.enabled)
+            Text("SSH targets are checked through their login shell. Codex QR-paired Remote connections cannot be reused by this app. To manage a paired device without SSH, run the maintenance CLI on that device through its Codex Remote chat.")
+                .font(.caption).foregroundStyle(.secondary)
+            Table(model.cliRows) {
+                TableColumn("Host", value: \.host).width(130)
+                TableColumn("CLI", value: \.tool).width(75)
+                TableColumn("Installed", value: \.installed).width(105)
+                TableColumn("Latest", value: \.latest).width(105)
+                TableColumn("Status") { row in Text(row.state).help(row.detail) }.width(min: 130)
+                TableColumn("Details", value: \.detail).width(min: 140)
+            }.frame(minHeight: 220)
+            Text(model.cliSummary).font(.callout).textSelection(.enabled)
+            if model.status == "Needs attention" {
+                Text(model.report).font(.caption).foregroundStyle(.orange).lineLimit(5).textSelection(.enabled)
+            }
+            HStack {
+                Button("Close") { model.showCLIs = false }.disabled(model.busy)
+                Spacer()
+                if model.busy { ProgressView().controlSize(.small) }
+                Button("Check versions", action: model.versions).disabled(model.busy)
+                Button("Upgrade selected CLIs", action: model.upgrade).disabled(model.busy || model.cliTargets.isEmpty)
+            }
+        }.padding(24).frame(width: 980, height: 620)
+        .alert("Upgrade CLIs on these targets?", isPresented: $model.cliConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Upgrade", action: model.applyCLIUpgrade)
+        } message: { Text(model.cliConfirmationText) }
     }
 }
 
@@ -437,8 +594,14 @@ struct AgentMaintenanceApp: App {
             do {
                 let configuration = try CLI.execute(["config"])
                 let diagnostics = configuration["local_diagnostics"] as? [String: Any] ?? [:]
+                let targets = configuration["upgrade_hosts"] as? [String] ?? []
+                var upgradeArguments: [String] = []
+                if !targets.isEmpty { upgradeArguments = try CLIUpgradeRequest(hosts: targets, tool: "all").arguments(apply: false) }
                 let report: [String: Any] = [
                     "hosts": configuration["hosts"] as? [String] ?? [],
+                    "upgrade_hosts": targets,
+                    "upgrade_arguments": upgradeArguments,
+                    "execution_host": diagnostics["hostname"] as? String ?? "",
                     "python": configuration["python"] as? String ?? "",
                     "codex": diagnostics["codex"] as? [String: Any] ?? [:],
                     "claude": diagnostics["claude"] as? [String: Any] ?? [:],

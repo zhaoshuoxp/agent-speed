@@ -26,14 +26,14 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Agent Maintenance</string>
 <key>CFBundleExecutable</key><string>AgentMaintenance</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.1.1</string>
-<key>CFBundleVersion</key><string>20261105.2</string>
+<key>CFBundleShortVersionString</key><string>0.1.2</string>
+<key>CFBundleVersion</key><string>20261105.3</string>
 <key>CFBundleIconFile</key><string>AgentMaintenance</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
-for item in agent_maintenance.py host.py README.txt find-python.sh; do
+for item in agent_maintenance.py host.py README.txt find-python.sh config.example.json; do
     cp "$SOURCE_DIR/$item" "$APP_DIR/Contents/Resources/CLI/$item"
 done
 cp "$SOURCE_DIR/desktop/assets/AgentMaintenance.icns" "$APP_DIR/Contents/Resources/AgentMaintenance.icns"

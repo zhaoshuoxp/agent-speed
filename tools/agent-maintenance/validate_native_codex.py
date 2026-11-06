@@ -17,7 +17,9 @@ import agent_maintenance as client
 
 
 def main():
-    executable = Path.home() / ".local/bin/codex"
+    executable = host.find_cli("codex")
+    if not executable:
+        raise RuntimeError("Codex CLI is required for native validation")
     with tempfile.TemporaryDirectory(prefix="native-codex-", dir=Path(__file__).parent) as directory:
         root = Path(directory).resolve()
         codex_home = root / ".codex"
@@ -51,7 +53,7 @@ def main():
                         return response["result"]
                 raise RuntimeError("App-server did not respond")
             try:
-                rpc(1, "initialize", {"clientInfo": {"name": "agent_maintenance_validation", "version": "0.1.0"},
+                rpc(1, "initialize", {"clientInfo": {"name": "agent_maintenance_validation", "version": host.VERSION},
                                        "capabilities": {"experimentalApi": True}})
                 process.stdin.write('{"jsonrpc":"2.0","method":"initialized"}\n')
                 process.stdin.flush()
@@ -83,8 +85,9 @@ def main():
             proof = client.verify_backup(backup)
             outcomes = []
             for operation in ("archive", "unarchive", "delete"):
-                request = {"operation": operation, "selector": {"sessions": [sid], "tool": "codex"},
-                           "backup_proof": proof["manifest"], "backup_sha256": proof["sha256"], "backup_path": proof["path"]}
+                request = {"operation": operation, "selector": {"sessions": [sid], "tool": "codex"}}
+                if operation == "archive":
+                    request.update(backup_proof=proof["manifest"], backup_sha256=proof["sha256"], backup_path=proof["path"])
                 # Native archive state updates are also aged within the fixture before the next action.
                 if operation != "archive":
                     with contextlib.closing(sqlite3.connect(database)) as db:
@@ -93,8 +96,10 @@ def main():
                         db.commit()
                     os.utime(current_path, (old, old))
                 plan = host.make_plan(request)
-                result = host.apply_plan({"plan": plan, "confirm": plan["plan_id"],
-                                          "verified_backup_sha256": proof["sha256"]})
+                apply_request = {"plan": plan, "confirm": plan["plan_id"]}
+                if operation == "archive":
+                    apply_request["verified_backup_sha256"] = proof["sha256"]
+                result = host.apply_plan(apply_request)
                 outcomes.append({"operation": operation, "verified": result["all_verified"], "results": result["results"]})
                 print(json.dumps(outcomes[-1]), flush=True)
                 if not result["all_verified"]:
