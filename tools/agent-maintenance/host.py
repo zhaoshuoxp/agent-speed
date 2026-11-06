@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+import ssl
 import stat
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import time
 import uuid
 import zipfile
 from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 VERSION = "0.1.0"
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
@@ -713,8 +715,28 @@ def version_key(value):
 
 
 def fetch_text(url):
-    with urlopen(Request(url, headers={"User-Agent": "AgentMaintenance/" + VERSION}), timeout=20) as response:
-        return response.read(2 << 20).decode().strip()
+    limit = 2 << 20
+    user_agent = "AgentMaintenance/" + VERSION
+    try:
+        with urlopen(Request(url, headers={"User-Agent": user_agent}), timeout=20) as response:
+            body = response.read(limit + 1)
+    except URLError as error:
+        if not isinstance(error.reason, ssl.SSLCertVerificationError):
+            raise
+        # Framework Python can lack a CA bundle. The system curl retains certificate validation.
+        curl = "/usr/bin/curl" if Path("/usr/bin/curl").is_file() else shutil.which("curl")
+        if not curl:
+            raise
+        response = subprocess.run(
+            [curl, "--fail", "--silent", "--show-error", "--location", "--max-time", "20",
+             "--max-filesize", str(limit), "--proto", "=https", "--proto-redir", "=https",
+             "--user-agent", user_agent, url],
+            capture_output=True, timeout=25, check=True,
+        )
+        body = response.stdout
+    if len(body) > limit:
+        raise ValueError("The release channel response is too large")
+    return body.decode().strip()
 
 
 def latest_version(tool):

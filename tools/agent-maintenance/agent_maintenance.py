@@ -89,6 +89,9 @@ def gather(hosts, request, timeout=120):
             host = futures[future]
             try:
                 results[host] = future.result()
+                for tool in results[host].get("tools", []):
+                    if tool.get("state") == "error":
+                        failures.append({"host": host, "tool": tool["tool"], "error": tool["error"]})
             except Exception as error:
                 failures.append({"host": host, "error": str(error)})
     return {"hosts": [{"host": host, **results[host]} for host in hosts if host in results], "failures": failures}

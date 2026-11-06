@@ -5,10 +5,13 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import ssl
+import subprocess
 import tempfile
 import time
 import unittest
 from unittest import mock
+from urllib.error import URLError
 import zipfile
 
 import agent_maintenance as client
@@ -203,6 +206,26 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertFalse(self.claude_path.exists())
         self.assertTrue(destination.exists())
+
+    def test_upgrade_error_is_reported_with_a_nonzero_exit_code(self):
+        result = {"tools": [{"tool": "codex", "state": "error", "error": "Release channel unavailable"}]}
+        output = io.StringIO()
+        with mock.patch.object(client, "invoke", return_value=result), contextlib.redirect_stdout(output):
+            status = client.main(["upgrade", "--host", "example", "--json"])
+        self.assertEqual(status, 1)
+        response = json.loads(output.getvalue())
+        self.assertEqual(response["failures"], [{"host": "example", "tool": "codex", "error": "Release channel unavailable"}])
+
+    def test_framework_python_certificate_failure_uses_verified_system_curl(self):
+        error = URLError(ssl.SSLCertVerificationError("Missing Python CA bundle"))
+        response = subprocess.CompletedProcess([], 0, stdout=b'{"tag_name":"rust-v0.166.0"}')
+        with mock.patch.object(host, "urlopen", side_effect=error), mock.patch.object(host.subprocess, "run", return_value=response) as run:
+            self.assertEqual(host.fetch_text("https://releases.openai.com/codex/channels/latest"), response.stdout.decode())
+        arguments = run.call_args.args[0]
+        self.assertIn("=https", arguments)
+        self.assertIn("--max-filesize", arguments)
+        self.assertNotIn("--insecure", arguments)
+        self.assertNotIn("-k", arguments)
 
 
 if __name__ == "__main__":
