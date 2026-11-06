@@ -4,6 +4,7 @@ import argparse
 import datetime
 from pathlib import Path
 import shutil
+import uuid
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--scripts-dir", type=Path, required=True)
@@ -25,9 +26,17 @@ for name in ("agent_maintenance.py", "host.py", "README.txt", "agent-maintenance
 for previous, replacement in (("codex_archives.py", "legacy_codex_archives.py"),
                               ("claude_sessions.py", "legacy_claude_sessions.py")):
     path = root / previous
+    body = (source / replacement).read_bytes()
+    if path.is_file() and path.read_bytes() == body:
+        continue
     if path.exists():
         shutil.copy2(path, backup / previous)
-    shutil.copyfile(source / replacement, path)
-    path.chmod(0o755)
+    temporary = root / ("." + previous + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temporary.write_bytes(body)
+        temporary.chmod(0o755)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 print("Installed delegates in " + str(root))
 print("Original scripts retained in " + str(backup))

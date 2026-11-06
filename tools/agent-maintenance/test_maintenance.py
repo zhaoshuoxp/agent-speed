@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -226,6 +227,21 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIn("--max-filesize", arguments)
         self.assertNotIn("--insecure", arguments)
         self.assertNotIn("-k", arguments)
+
+    def test_legacy_install_preserves_readonly_originals_and_replaces_entries(self):
+        scripts = self.base / "scripts"
+        scripts.mkdir()
+        for name in ("codex_archives.py", "claude_sessions.py"):
+            path = scripts / name
+            path.write_text("original " + name)
+            path.chmod(0o444)
+        installer = Path(__file__).resolve().with_name("install_legacy.py")
+        subprocess.run([sys.executable, str(installer), "--scripts-dir", str(scripts)], check=True, capture_output=True)
+        backup = next(scripts.glob("agent-maintenance-originals-*"))
+        for name in ("codex_archives.py", "claude_sessions.py"):
+            self.assertEqual((backup / name).read_text(), "original " + name)
+            self.assertIn("agent_maintenance", (scripts / name).read_text())
+        self.assertTrue((scripts / "agent-maintenance/host.py").is_file())
 
 
 if __name__ == "__main__":
