@@ -5,7 +5,5 @@ MAINTENANCE_BIN="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/agent-ma
 arguments=(upgrade --tool all --apply)
 if (( $# > 0 )); then
     for alias in "$@"; do arguments+=(--host "$alias"); done
-else
-    arguments+=(--host all)
 fi
 exec "$MAINTENANCE_BIN" "${arguments[@]}"

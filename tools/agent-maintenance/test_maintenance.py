@@ -9,6 +9,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -334,6 +335,32 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(result["hosts"], ["local", "thor", "loki"])
         self.assertEqual(result["upgrade_hosts"], ["loki"])
         self.assertEqual(json.loads(path.read_text())["upgrade_hosts"], ["loki"])
+
+    def test_server_updaters_do_not_overlap_and_continue_after_a_host_failure(self):
+        lock = threading.Lock()
+        active, maximum, visited = 0, 0, []
+
+        def update(name, request, timeout):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                visited.append(name)
+            try:
+                time.sleep(0.02)
+                if name == "loki":
+                    raise RuntimeError("Fixture connection failure")
+                return {"tools": [{"tool": "codex", "state": "updated"}]}
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch.object(client, "invoke", side_effect=update):
+            result = client.gather(["thor", "loki", "freya"], {"action": "versions", "apply": True})
+        self.assertEqual(maximum, 1)
+        self.assertEqual(visited, ["thor", "loki", "freya"])
+        self.assertEqual([row["host"] for row in result["hosts"]], ["thor", "freya"])
+        self.assertEqual(result["failures"], [{"host": "loki", "error": "Fixture connection failure"}])
 
     def test_native_upgrade_skips_newer_versions_and_rechecks_updated_version(self):
         def response(value):

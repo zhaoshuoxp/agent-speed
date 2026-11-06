@@ -192,7 +192,8 @@ def invoke(host, request, timeout=120):
 
 def gather(hosts, request, timeout=120):
     results, failures = {}, []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(hosts))) as executor:
+    workers = 1 if request.get("action") == "versions" and request.get("apply") else min(5, len(hosts))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(invoke, host, request, timeout): host for host in hosts}
         for future in concurrent.futures.as_completed(futures):
             host = futures[future]
