@@ -21,6 +21,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AppCommands {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--verify-custom-update-protection") {
+            CustomUpdateProtectionCheck.start()
+            return
+        }
         if let directory = options.previewDirectory {
             PreviewRenderer.run(into: directory)
             NSApp.terminate(nil)
@@ -284,6 +288,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, AppCommands {
     }
 
     func checkForUpdates() {
+        guard model?.updates.updatesAllowed != false else {
+            showSettings(.about)
+            return
+        }
         model?.updates.startCheck(manual: true)
         showUpdate()
     }

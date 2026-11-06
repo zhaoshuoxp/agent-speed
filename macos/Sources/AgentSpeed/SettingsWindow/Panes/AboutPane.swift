@@ -22,6 +22,10 @@ struct AboutPane: View {
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .padding(.top, Spacing.xs)
+            if !model.updates.updatesAllowed {
+                Text("SSH Usage custom build").font(.callout.weight(.medium)).foregroundStyle(.blue)
+                    .padding(.top, Spacing.xxs)
+            }
 
             VStack(spacing: Spacing.xxs) {
                 Link(destination: AppInfo.repositoryURL) {
@@ -45,7 +49,7 @@ struct AboutPane: View {
                 .padding(.top, Spacing.s)
 
             VStack(spacing: Spacing.xxs) {
-                Text(l10n("settings.about.update"))
+                Text(model.updates.updatesAllowed ? l10n("settings.about.update") : "Upstream updates are disabled for this custom build.")
                 Text(l10n("mac.settings.about.copyright"))
             }
             .font(.subheadline)

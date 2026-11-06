@@ -11,6 +11,7 @@ struct SourcesPane: View {
     var body: some View {
         let l10n = model.l10n
         Form {
+            SSHUsageSection(model: model)
             ForEach(TranscriptFolder.allCases, id: \.self) { folder in
                 let kinds = SourceKind.allCases.filter { $0.transcriptFolder == folder }
                 Section {

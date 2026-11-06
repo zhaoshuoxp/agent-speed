@@ -18,6 +18,7 @@ struct UpdateInstaller: Sendable {
     /// Every temporary file lives in one private workspace that is deleted on success and on failure.
     @concurrent
     func install(_ release: Release, progress: @escaping @Sendable (Step) -> Void) async throws {
+        guard configuration.updatesAllowed else { throw CustomBuildUpdateError() }
         guard target.pathExtension == "app" else { throw UpdateFailure.notBundled }
         try replacer.checkWritable()
         let (archiveAsset, sumsAsset) = try assets(of: release)

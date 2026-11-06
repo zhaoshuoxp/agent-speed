@@ -12,6 +12,17 @@ struct UpdateSettingsCard: View {
         let l10n = model.l10n
         let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
         VStack(spacing: 0) {
+            if !model.updates.updatesAllowed {
+                HStack(alignment: .top, spacing: Spacing.s) {
+                    Image(systemName: "lock.shield.fill").foregroundStyle(.blue)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("SSH Usage custom build").fontWeight(.medium)
+                        Footnote("Upstream update checks, downloads, and installation are disabled to preserve the custom SSH controls. Updates are installed from a rebuilt custom package.")
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(Spacing.m)
+            } else {
             UpdateStatusRow(model: model)
                 .padding(Spacing.m)
             Hairline()
@@ -31,6 +42,7 @@ struct UpdateSettingsCard: View {
             .padding(Spacing.m)
             // With the network master switch off, no check runs (NETWORK 2).
             .disabled(!settings.networkEnabled)
+            }
         }
         .background(Color.primary.opacity(0.04), in: shape)
         .overlay {

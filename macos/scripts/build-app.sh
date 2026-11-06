@@ -28,6 +28,7 @@ Options:
   --output DIR      Output directory (default: <repo>/dist).
   --binary PATH     Package an existing universal executable instead of
                     running swift build.
+  --custom-build    Disable upstream updates for this locally customized app.
   -h, --help        Show this help.
 
 Outputs:
@@ -55,6 +56,7 @@ VERSION=""
 BUILD_NUMBER=""
 OUTPUT_DIR="$REPO_ROOT/dist"
 PREBUILT_BINARY=""
+CUSTOM_BUILD=true
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --output=*) OUTPUT_DIR="${1#*=}"; shift ;;
         --binary) need_value "$@"; PREBUILT_BINARY="$2"; shift 2 ;;
         --binary=*) PREBUILT_BINARY="${1#*=}"; shift ;;
+        --custom-build) CUSTOM_BUILD=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "Unknown argument: $1" "Run with --help for usage." ;;
     esac
@@ -106,6 +109,7 @@ if [[ -n "$PREBUILT_BINARY" ]]; then
     info "$BINARY"
 else
     SWIFT_FLAGS=(-c release --arch arm64 --arch x86_64 --package-path "$MACOS_DIR" --scratch-path "$SCRATCH_PATH")
+    if [[ -n "${AGENTSPEED_SDK_PATH:-}" ]]; then SWIFT_FLAGS+=(--sdk "$AGENTSPEED_SDK_PATH"); fi
     step "Building universal release (arm64 + x86_64)"
     swift build "${SWIFT_FLAGS[@]}" \
         || die "swift build failed." "Fix the compiler errors above and run the script again."
@@ -127,7 +131,7 @@ done
 # with its deployment target as SDK runs in the compatibility appearance. Depending on the Xcode version, SwiftPM's
 # linker step stamps the deployment target instead of the SDK it compiled against, so the stamp is set here.
 step "Checking the SDK stamp"
-EXPECTED_SDK="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)"
+EXPECTED_SDK="$(xcrun --sdk "${AGENTSPEED_SDK_PATH:-macosx}" --show-sdk-version 2>/dev/null || true)"
 [[ -n "$EXPECTED_SDK" ]] || die "Could not determine the macOS SDK version." "Check the selected Xcode with: xcode-select -p"
 MINOS="$(vtool -arch arm64 -show-build "$BINARY" 2>/dev/null | awk '$1 == "minos" { print $2; exit }')"
 [[ -n "$MINOS" ]] || die "Could not read the minimum macOS version of the executable."
@@ -157,9 +161,14 @@ if grep -q '__[A-Z_]*__' "$APP_DIR/Contents/Info.plist"; then
     die "Info.plist still contains unresolved placeholders." "$(grep -o '__[A-Z_]*__' "$APP_DIR/Contents/Info.plist" | sort -u | tr '\n' ' ')"
 fi
 plutil -lint -s "$APP_DIR/Contents/Info.plist" || die "The generated Info.plist is invalid."
+if [[ "$CUSTOM_BUILD" == true ]]; then
+    /usr/libexec/PlistBuddy -c 'Add :AgentSpeedCustomBuild bool true' "$APP_DIR/Contents/Info.plist"
+fi
 
 printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
 cp "$ICON_FILE" "$APP_DIR/Contents/Resources/AgentSpeed.icns"
+mkdir -p "$APP_DIR/Contents/Resources/SSHUsage"
+cp "$MACOS_DIR/Resources/SSHUsage/sync_usage.py" "$APP_DIR/Contents/Resources/SSHUsage/sync_usage.py"
 info "Contents/MacOS/$EXECUTABLE, Info.plist, PkgInfo, Resources/AgentSpeed.icns"
 
 step "Signing (ad hoc)"

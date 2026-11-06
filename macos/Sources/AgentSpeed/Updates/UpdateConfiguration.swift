@@ -18,6 +18,18 @@ struct UpdateConfiguration: Sendable {
     let feedURL: URL
     let policy: UpdateURLPolicy
     let currentVersion: String
+    let updatesAllowed: Bool
+
+    init(feedURL: URL, policy: UpdateURLPolicy, currentVersion: String, updatesAllowed: Bool = true) {
+        self.feedURL = feedURL
+        self.policy = policy
+        self.currentVersion = currentVersion
+        self.updatesAllowed = updatesAllowed
+    }
+
+    static var isCustomBuild: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "AgentSpeedCustomBuild") as? Bool == true
+    }
 
     var userAgent: String { "AgentSpeed/\(currentVersion) (macOS)" }
 
@@ -28,14 +40,15 @@ struct UpdateConfiguration: Sendable {
 
     static func current(environment: [String: String] = ProcessInfo.processInfo.environment) -> UpdateConfiguration {
         let version = bundleVersion
+        let allowed = !isCustomBuild
         if let override = environment[feedOverrideVariable], !override.isEmpty {
             if let url = URL(string: override), UpdateURLPolicy.testing.permits(url) {
                 UpdateLog.logger.notice("Update feed override active (\(url.scheme ?? "", privacy: .public)://\(url.host() ?? "", privacy: .public))")
-                return UpdateConfiguration(feedURL: url, policy: .testing, currentVersion: version)
+                return UpdateConfiguration(feedURL: url, policy: .testing, currentVersion: version, updatesAllowed: allowed)
             }
             UpdateLog.logger.error("Ignoring \(feedOverrideVariable, privacy: .public): not an http(s) URL")
         }
-        return UpdateConfiguration(feedURL: releaseFeedURL, policy: .standard, currentVersion: version)
+        return UpdateConfiguration(feedURL: releaseFeedURL, policy: .standard, currentVersion: version, updatesAllowed: allowed)
     }
 
     /// The release page to open for "View on GitHub", never a URL outside the policy.
@@ -43,6 +56,10 @@ struct UpdateConfiguration: Sendable {
         if let url = release?.pageURL, policy.permits(url) { return url }
         return Self.releasesPageURL
     }
+}
+
+struct CustomBuildUpdateError: LocalizedError {
+    var errorDescription: String? { "Upstream updates are disabled for this custom build to preserve its SSH features." }
 }
 
 enum UpdateLog {

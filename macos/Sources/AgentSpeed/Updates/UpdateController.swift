@@ -83,13 +83,15 @@ final class UpdateController {
 
     /// The release on offer: found by the last check and neither skipped nor superseded.
     var availableRelease: Release? {
+        guard updatesAllowed else { return nil }
         if case .available(let release) = status { return release }
         return nil
     }
 
     var isChecking: Bool { status == .checking }
     var isBusy: Bool { isChecking || installation.isActive }
-    var checksAutomatically: Bool { UpdateSchedule.checksAutomatically(currentVersion: currentVersion) }
+    var updatesAllowed: Bool { configuration.updatesAllowed }
+    var checksAutomatically: Bool { updatesAllowed && UpdateSchedule.checksAutomatically(currentVersion: currentVersion) }
 
     // MARK: Checking
 
@@ -98,7 +100,7 @@ final class UpdateController {
     /// and errors; automatic checks only announce new versions and fail silently.
     @discardableResult
     func startCheck(manual: Bool) -> Task<Void, Never> {
-        guard !installation.isActive, networkEnabled else { return Task {} }
+        guard updatesAllowed, !installation.isActive, networkEnabled else { return Task {} }
         if manual, !checkIsManual {
             checkIsManual = true
             statusBeforeCheck = status
@@ -172,7 +174,7 @@ final class UpdateController {
 
     /// "Skip This Version": automatic checks never offer this tag again.
     func skip() {
-        guard let release = availableRelease, !installation.isActive else { return }
+        guard updatesAllowed, let release = availableRelease, !installation.isActive else { return }
         store.skippedTag = release.tag
         UpdateLog.logger.notice("Skipped \(release.tag, privacy: .public)")
         status = .idle
@@ -195,7 +197,7 @@ final class UpdateController {
     // MARK: Installing
 
     func install() {
-        guard let release = availableRelease, !installation.isActive else { return }
+        guard updatesAllowed, let release = availableRelease, !installation.isActive else { return }
         UpdateLog.logger.notice("Installing \(release.tag, privacy: .public) over \(self.currentVersion, privacy: .public)")
         installation = .downloading(0)
         let installer = UpdateInstaller(configuration: configuration, target: Bundle.main.bundleURL)

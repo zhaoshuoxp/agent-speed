@@ -31,6 +31,8 @@ jobs:
         run: python3 spec/tools/vehicles.py
       - name: Lint installer
         run: shellcheck install.sh
+      - name: Test maintenance CLI
+        run: python3 -m unittest discover -s tools/agent-maintenance -p test_maintenance.py -v
 
   macos:
     name: macOS
@@ -53,8 +55,12 @@ jobs:
       - name: Test update relaunch
         timeout-minutes: 5
         run: python3 macos/scripts/test-update-relaunch.py
+      - name: Test SSH cache safety
+        run: python3 -m unittest discover -s macos/Tests/SSHUsageHelperTests -v
       - name: Build app bundle
         run: macos/scripts/build-app.sh
+      - name: Verify custom build protection
+        run: python3 macos/scripts/test-custom-build.py "dist/Agent Speed.app"
       - uses: actions/upload-artifact@v7
         with:
           name: AgentSpeed-macOS

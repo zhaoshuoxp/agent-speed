@@ -12,6 +12,7 @@ struct UpdateConfiguration: Sendable {
     let feedURL: URL
     let policy: UpdateURLPolicy
     let currentVersion: String
+    let updatesAllowed = true
 
     var userAgent: String { "AgentSpeedUpdateIsolation/\(currentVersion)" }
 
@@ -23,6 +24,8 @@ struct UpdateConfiguration: Sendable {
         )
     }
 }
+
+struct CustomBuildUpdateError: Error {}
 
 enum UpdateLog {
     static let logger = Logger(subsystem: UpdateConfiguration.bundleIdentifier, category: "update-isolation")

@@ -51,6 +51,7 @@ final class AppModel {
     let titles: TitleThemesController
     let accessibility: AccessibilityState
     let launchAtLogin: LaunchAtLogin
+    let sshUsage: SSHUsageController
     let updates: UpdateController
     /// Price tables and day bindings shared by the live engine and the history (METRICS 9.7).
     let priceBook: PriceBook
@@ -101,6 +102,7 @@ final class AppModel {
         titles = TitleThemesController(defaults: settings.storage)
         accessibility = AccessibilityState()
         launchAtLogin = LaunchAtLogin()
+        sshUsage = SSHUsageController(directory: Self.appDataDirectory.appendingPathComponent("SSHUsage", isDirectory: true))
         let userAgent = "AgentSpeed/\(UpdateConfiguration.bundleVersion) (macOS)"
         priceBook = PriceBook()
         prices = PriceSyncController(book: priceBook, userAgent: userAgent)
@@ -182,6 +184,7 @@ final class AppModel {
         boards.activate(model: self)
         titles.activate(model: self)
         guard live else { return }
+        Task { await sshUsage.refresh() }
         // Stored day bindings first, so the engine never re-binds a day that was priced before (METRICS 9.7).
         HistoryService.restorePricing(into: priceBook)
         activateNetwork()

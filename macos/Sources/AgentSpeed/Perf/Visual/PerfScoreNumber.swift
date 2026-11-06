@@ -5,7 +5,14 @@ import SwiftUI
 
 extension EnvironmentValues {
     /// Reduce Motion as the app sees it (`AccessibilityState`, which a harness may force), set by each surface's host.
-    @Entry var perfReduceMotion = false
+    var perfReduceMotion: Bool {
+        get { self[PerfReduceMotionKey.self] }
+        set { self[PerfReduceMotionKey.self] = newValue }
+    }
+}
+
+private struct PerfReduceMotionKey: EnvironmentKey {
+    static let defaultValue = false
 }
 
 /// The two number forms of a surface (DESIGN 12, *Number formats*).
