@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import datetime
 import hashlib
+import glob
 import json
 import os
 from pathlib import Path
@@ -14,9 +15,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 ENGINE = Path(__file__).with_name("host.py")
 SSH_OPTIONS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
                "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no", "-o", "ControlMaster=no",
@@ -24,21 +26,114 @@ SSH_OPTIONS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "Co
                "-o", "ServerAliveCountMax=2"]
 
 
-def configured_hosts():
+def configuration_path():
+    return Path(os.environ.get("AGENT_MAINTENANCE_CONFIG", str(Path.home() / ".config/agent-maintenance/config.json"))).expanduser()
+
+
+def read_configuration():
+    path = configuration_path()
+    if not path.exists():
+        return {}
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict):
+        raise ValueError("The maintenance configuration must be a JSON object: " + str(path))
+    return value
+
+
+def ssh_hosts():
+    """List literal aliases, including user configuration includes; never read identity files."""
+    directory = Path.home() / ".ssh"
+    seen, aliases = set(), []
+    def visit(path, depth=0):
+        if depth > 12 or path.resolve() in seen or not path.is_file():
+            return
+        seen.add(path.resolve())
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                parts = shlex.split(line, comments=True)
+            except ValueError:
+                continue
+            if not parts:
+                continue
+            key, separator, inline = parts[0].partition("=")
+            values = ([inline] if separator and inline else []) + parts[1:]
+            if values and values[0] == "=":
+                values = values[1:]
+            if key.lower() == "host":
+                aliases.extend(value for value in values
+                               if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) and value != "local")
+            elif key.lower() == "include":
+                for value in values:
+                    included = Path(value).expanduser()
+                    if not included.is_absolute():
+                        included = directory / included
+                    for filename in sorted(glob.glob(str(included))):
+                        visit(Path(filename), depth + 1)
+    visit(directory / "config")
+    return list(dict.fromkeys(aliases))
+
+
+def host_configuration():
     override = os.environ.get("AGENT_MAINTENANCE_HOSTS")
     if override:
-        return list(dict.fromkeys(["local", *filter(None, re.split(r"[,\s]+", override))]))
-    paths = [Path.home() / ".config/agent-maintenance/config.json",
-             Path.home() / "Library/Application Support/AgentSpeed/SSHUsage/config.json"]
-    for path in paths:
+        values, source = list(filter(None, re.split(r"[,\s]+", override))), "environment"
+    else:
+        settings = read_configuration()
+        if "hosts" in settings:
+            values, source = settings["hosts"], "maintenance configuration"
+        else:
+            path = Path.home() / "Library/Application Support/AgentSpeed/SSHUsage/config.json"
+            settings = json.loads(path.read_text()) if path.is_file() else {}
+            if "hosts" in settings:
+                values, source = settings["hosts"], "Agent Speed configuration"
+            else:
+                values, source = ssh_hosts(), "SSH configuration"
+    values = [item["host"] if isinstance(item, dict) else item for item in values]
+    if not all(isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item) for item in values):
+        raise ValueError("Configured hosts must be literal SSH aliases")
+    return {"hosts": list(dict.fromkeys(["local", *values])), "host_source": source,
+            "discovered_ssh_hosts": ssh_hosts(), "configuration_path": str(configuration_path())}
+
+
+def configured_hosts():
+    return host_configuration()["hosts"]
+
+
+def configure(args):
+    settings = read_configuration()
+    changed = args.hosts is not None or args.auto_hosts or args.codex_home is not None or args.claude_home is not None
+    if args.auto_hosts:
+        settings.pop("hosts", None)
+    elif args.hosts is not None:
+        values = [value for value in re.split(r"[,\s]+", args.hosts) if value and value != "local"]
+        if not all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) for value in values):
+            raise ValueError("Use literal SSH aliases separated by commas or newlines")
+        settings["hosts"] = list(dict.fromkeys(values))
+    roots = settings.setdefault("data_roots", {})
+    for key, value in (("codex", args.codex_home), ("claude", args.claude_home)):
+        if value is not None:
+            if value.strip():
+                path = Path(value).expanduser().resolve()
+                if path.exists() and not path.is_dir():
+                    raise ValueError("An agent data home must be a directory: " + str(path))
+                roots[key] = str(path)
+            else:
+                roots.pop(key, None)
+    if changed:
+        path = configuration_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.exists():
+            shutil.copy2(path, path.with_name("config.backup-" + str(time.time_ns()) + ".json"))
+        temporary = path.with_name(".config-" + str(time.time_ns()) + ".tmp")
         try:
-            settings = json.loads(path.read_text())
-            values = [item["host"] if isinstance(item, dict) else item for item in settings["hosts"]]
-            if all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item) for item in values):
-                return list(dict.fromkeys(["local", *values]))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    return ["local"]
+            temporary.write_text(json.dumps(settings, indent=2) + "\n")
+            temporary.chmod(0o600)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {**host_configuration(), "explicit_hosts": "hosts" in settings,
+            "configured_data_roots": settings.get("data_roots", {}), "python": sys.executable,
+            "local_diagnostics": invoke("local", {"action": "diagnostics"})}
 
 
 def size(value):
@@ -237,6 +332,15 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     child = commands.add_parser("hosts", help="List local and configured SSH hosts")
     common(child)
+    child = commands.add_parser("config", help="Read or update host and local data-source settings")
+    common(child)
+    group = child.add_mutually_exclusive_group()
+    group.add_argument("--hosts", help="Comma or whitespace-separated aliases; empty means local only")
+    group.add_argument("--auto-hosts", action="store_true", help="Restore automatic host discovery")
+    child.add_argument("--codex-home", help="Local Codex data directory; empty restores automatic selection")
+    child.add_argument("--claude-home", help="Local Claude data directory; empty restores automatic selection")
+    child = commands.add_parser("diagnose", help="Report data roots and record counts without conversation content")
+    common(child)
     child = commands.add_parser("interactive", help="Browse and maintain conversations interactively")
     common(child)
     selection_arguments(child)
@@ -381,7 +485,11 @@ def main(argv=None):
     hosts = host_names(args)
     try:
         if args.command == "hosts":
-            result = {"hosts": configured_hosts()}
+            result = host_configuration()
+        elif args.command == "config":
+            result = configure(args)
+        elif args.command == "diagnose":
+            result = gather(hosts, {"action": "diagnostics"})
         elif args.command == "interactive":
             return interactive(args)
         elif args.command in ("inspect", "sessions", "projects"):

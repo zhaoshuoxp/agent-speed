@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import shutil
 import sys
+import time
 
 parser = argparse.ArgumentParser(description=__doc__)
 default = (Path.home() / "Library/Application Support/AgentMaintenance/CLI" if sys.platform == "darwin"
@@ -13,14 +14,16 @@ default = (Path.home() / "Library/Application Support/AgentMaintenance/CLI" if s
 parser.add_argument("--prefix", type=Path, default=default)
 parser.add_argument("--bin-dir", type=Path, default=Path.home() / ".local/bin")
 args = parser.parse_args()
-stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+if sys.version_info < (3, 9):
+    raise SystemExit("Python 3.9+ is required")
+stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + str(time.time_ns())
 prefix = args.prefix.expanduser().resolve()
 binary = args.bin_dir.expanduser().resolve() / "agent-maintenance"
 if prefix.exists():
     prefix.rename(prefix.with_name(prefix.name + ".backup-" + stamp))
 prefix.mkdir(parents=True, mode=0o700)
 source = Path(__file__).resolve().parent
-for name in ("agent_maintenance.py", "host.py", "README.txt"):
+for name in ("agent_maintenance.py", "host.py", "README.txt", "find-python.sh"):
     shutil.copyfile(source / name, prefix / name)
     (prefix / name).chmod(0o600)
 binary.parent.mkdir(parents=True, exist_ok=True)

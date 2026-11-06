@@ -20,7 +20,7 @@ destination = root / "agent-maintenance"
 if destination.exists():
     destination.rename(backup / "agent-maintenance")
 destination.mkdir(mode=0o755)
-for name in ("agent_maintenance.py", "host.py", "README.txt", "agent-maintenance"):
+for name in ("agent_maintenance.py", "host.py", "README.txt", "agent-maintenance", "find-python.sh"):
     shutil.copyfile(source / name, destination / name)
     (destination / name).chmod(0o755 if name == "agent-maintenance" else 0o644)
 for previous, replacement in (("codex_archives.py", "legacy_codex_archives.py"),

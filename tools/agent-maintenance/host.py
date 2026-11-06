@@ -22,15 +22,18 @@ import zipfile
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 RECENT_SECONDS = 300
 
 
 def roots():
     home = Path.home()
-    return {"codex": Path(os.environ.get("CODEX_HOME", str(home / ".codex"))).expanduser(),
-            "claude": Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude"))).expanduser(),
+    config = Path(os.environ.get("AGENT_MAINTENANCE_CONFIG", str(home / ".config/agent-maintenance/config.json"))).expanduser()
+    settings = json.loads(config.read_text()) if config.is_file() else {}
+    configured = settings.get("data_roots", {})
+    return {"codex": Path(os.environ.get("CODEX_HOME") or configured.get("codex") or home / ".codex").expanduser(),
+            "claude": Path(os.environ.get("CLAUDE_CONFIG_DIR") or configured.get("claude") or home / ".claude").expanduser(),
             "claude-archive": Path(os.environ.get("CLAUDE_ARCHIVE_DIR", str(home / ".claude-archive"))).expanduser()}
 
 
@@ -117,7 +120,7 @@ def scan_codex():
                 if not {"id", "rollout_path"}.issubset(fields):
                     continue
                 projects = {}
-                if columns(db, "projects"):
+                if {"id", "name"}.issubset(columns(db, "projects")):
                     projects = {row["id"]: row["name"] for row in db.execute("select id,name from projects")}
                 if columns(db, "thread_spawn_edges"):
                     for parent, child in db.execute("select parent_thread_id,child_thread_id from thread_spawn_edges"):
@@ -312,9 +315,26 @@ def inventory(include_storage=False):
             children.setdefault((row["tool"], row["parent_id"]), []).append(row["id"])
     for row in records:
         row["children"] = children.get((row["tool"], row["id"]), [])
-    return {"version": VERSION, "machine_id": machine_id(), "hostname": os.uname().nodename,
+    result = {"version": VERSION, "machine_id": machine_id(), "hostname": os.uname().nodename,
             "home": str(Path.home()), "sessions": records, "errors": errors + more,
             "storage": storage_info() if include_storage else []}
+    result["diagnostics"] = diagnostics(result)
+    return result
+
+
+def diagnostics(data):
+    locations = roots()
+    result = {"home": str(Path.home()), "errors": data["errors"]}
+    for tool in ("codex", "claude"):
+        rows = [row for row in data["sessions"] if row["tool"] == tool]
+        visible = selected_sessions(data, {"tool": tool}, expand=False)
+        result[tool] = {"root": str(locations[tool]), "exists": locations[tool].is_dir(),
+                        "total_records": len(rows), "visible_records": len(visible),
+                        "subagent_records": sum(bool(row.get("is_subagent")) for row in rows),
+                        "missing_transcripts": sum(not Path(row["path"]).is_file() for row in rows)}
+        if tool == "codex":
+            result[tool]["databases"] = [str(path) for path in state_databases(locations[tool])]
+    return result
 
 
 def selected_sessions(data, selector, expand=True):
@@ -323,6 +343,7 @@ def selected_sessions(data, selector, expand=True):
     project = selector.get("project")
     query = selector.get("query", "").lower()
     archived = selector.get("archived", "all")
+    known = {(row["tool"], row["id"]) for row in data["sessions"]}
     rows = []
     for row in data["sessions"]:
         if tool != "all" and row["tool"] != tool:
@@ -336,7 +357,8 @@ def selected_sessions(data, selector, expand=True):
             continue
         if archived != "all" and row["archived"] != (archived == "yes"):
             continue
-        if not wanted and row.get("is_subagent", bool(row["parent_id"])) and not selector.get("include_subagents"):
+        if (not wanted and row.get("is_subagent", bool(row["parent_id"]))
+                and (row["tool"], row["parent_id"]) in known and not selector.get("include_subagents")):
             continue
         rows.append(row)
     if wanted - {row["id"] for row in rows}:
@@ -798,6 +820,8 @@ def dispatch(request, output=None):
     action = request.get("action", "inventory")
     if action == "inventory":
         return inventory(request.get("storage", False))
+    if action == "diagnostics":
+        return inventory()["diagnostics"]
     if action == "backup":
         backup(request["selector"], output or sys.stdout.buffer)
         return None

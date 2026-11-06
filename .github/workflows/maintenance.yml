@@ -1,0 +1,49 @@
+name: Maintenance app compatibility
+
+on:
+  push:
+    branches: [main]
+    paths: ['tools/agent-maintenance/**', '.github/workflows/maintenance.yml']
+  pull_request:
+    paths: ['tools/agent-maintenance/**', '.github/workflows/maintenance.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintenance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cli:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ['3.9', '3.13']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tools/agent-maintenance -p test_maintenance.py -v
+  desktop:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Select newest stable Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode*.app | grep -viE 'beta|_rc|release_candidate' | sort -V | tail -1)"
+          sudo xcode-select -s "$xcode"
+      - name: Test with system Python
+        run: /usr/bin/python3 -m unittest discover -s tools/agent-maintenance -p test_maintenance.py -v
+      - name: Build and verify app
+        run: |
+          tools/agent-maintenance/desktop/build-app.sh "$RUNNER_TEMP/maintenance-app"
+          /usr/bin/python3 tools/agent-maintenance/desktop/verify-app.py "$RUNNER_TEMP/maintenance-app/Agent Maintenance.app" --python /usr/bin/python3
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AgentMaintenance-macOS
+          path: ${{ runner.temp }}/maintenance-app/AgentMaintenance-macOS.zip
+          if-no-files-found: error

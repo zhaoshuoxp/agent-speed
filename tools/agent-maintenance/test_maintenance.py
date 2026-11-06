@@ -35,7 +35,9 @@ class MaintenanceTests(unittest.TestCase):
         self.archived = self.base / ".claude-archive"
         self.environment = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.codex),
                                                         "CLAUDE_CONFIG_DIR": str(self.claude),
-                                                        "CLAUDE_ARCHIVE_DIR": str(self.archived)})
+                                                        "CLAUDE_ARCHIVE_DIR": str(self.archived),
+                                                        "AGENT_MAINTENANCE_HOSTS": "",
+                                                        "AGENT_MAINTENANCE_CONFIG": str(self.base / "maintenance/config.json")})
         self.environment.start()
         self.age = time.time() - 45 * 86400
         self.project = self.base / "ExampleProject"
@@ -98,6 +100,62 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual({row["id"] for row in selected}, {PARENT, CHILD})
         mains = host.selected_sessions(inventory, {"tool": "codex"}, expand=False)
         self.assertEqual([row["id"] for row in mains], [PARENT])
+
+    def test_guardian_only_store_keeps_orphan_roots_visible(self):
+        with contextlib.closing(sqlite3.connect(self.database)) as database:
+            database.execute("update threads set source=?,thread_source='guardian_review' where id=?",
+                             ('{"subagent":{"other":"guardian"}}', PARENT))
+            database.commit()
+        data = host.inventory()
+        rows = host.selected_sessions(data, {"tool": "codex"}, expand=False)
+        self.assertEqual([row["id"] for row in rows], [PARENT])
+        self.assertTrue(rows[0]["is_subagent"])
+        self.assertEqual(data["diagnostics"]["codex"]["total_records"], 2)
+        self.assertEqual(data["diagnostics"]["codex"]["visible_records"], 1)
+        every = host.selected_sessions(data, {"tool": "codex", "include_subagents": True}, expand=False)
+        self.assertEqual({row["id"] for row in every}, {PARENT, CHILD})
+
+    def test_ssh_alias_discovery_handles_includes_and_skips_patterns(self):
+        ssh = self.base / ".ssh"
+        (ssh / "config.d").mkdir(parents=True)
+        (ssh / "config").write_text('Host thor loki\n  HostName example.test\nInclude config.d/*.conf\nHost * !private *.invalid\n')
+        (ssh / "config.d/hosts.conf").write_text('Host=freya\nHost "bordeaux" champagne\nInclude config\n')
+        self.assertEqual(client.configured_hosts(), ["local", "thor", "loki", "freya", "bordeaux", "champagne"])
+        self.assertEqual(client.host_configuration()["host_source"], "SSH configuration")
+
+    def test_explicit_host_configuration_can_select_local_only(self):
+        path = client.configuration_path()
+        path.parent.mkdir()
+        path.write_text('{"hosts":[]}')
+        self.assertEqual(client.configured_hosts(), ["local"])
+
+    def test_source_configuration_preserves_existing_keys_and_backup(self):
+        path = client.configuration_path()
+        path.parent.mkdir()
+        path.write_text('{"existing_option":"retained","hosts":["previous"]}')
+        options = client.parser().parse_args(["config", "--hosts", "thor,loki", "--codex-home", str(self.codex)])
+        result = client.configure(options)
+        settings = json.loads(path.read_text())
+        self.assertEqual(settings["existing_option"], "retained")
+        self.assertEqual(result["hosts"], ["local", "thor", "loki"])
+        self.assertEqual(settings["data_roots"]["codex"], str(self.codex))
+        self.assertEqual(len(list(path.parent.glob("config.backup-*.json"))), 1)
+
+    def test_projects_schema_without_name_does_not_hide_threads(self):
+        with contextlib.closing(sqlite3.connect(self.database)) as database:
+            database.execute("create table projects(id text,title text)")
+            database.commit()
+        rows, errors = host.scan_codex()
+        self.assertEqual({row["id"] for row in rows}, {PARENT, CHILD})
+        self.assertEqual(errors, [])
+
+    def test_python_discovery_skips_an_incompatible_candidate(self):
+        old = self.base / "old-python"
+        old.write_text("#!/bin/sh\nexit 1\n")
+        old.chmod(0o755)
+        finder = Path(__file__).resolve().with_name("find-python.sh")
+        found = subprocess.check_output(["/bin/bash", str(finder), str(old), sys.executable], text=True).strip()
+        self.assertEqual(found, sys.executable)
 
     def test_backup_preserves_raw_media_children_database_rows_and_readable_export(self):
         proof = self.make_backup({"sessions": [PARENT], "tool": "codex"})

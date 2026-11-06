@@ -1,12 +1,12 @@
-Agent Maintenance 0.1.0
+Agent Maintenance 0.1.1
 
 DESKTOP APP
-The separate Agent Maintenance macOS app uses this same CLI. It lists local and SSH hosts, filters conversations by project/tool/archive state, backs up selected conversations or a project, previews archive/unarchive/delete and log/temp cleanup, verifies and restores standalone backups, and checks or applies CLI upgrades. Every mutation shows a reviewed plan before confirmation. Build a universal app with desktop/build-app.sh OUTPUT_DIRECTORY using a compatible SDK or complete Xcode installation. Python 3 must be available on the Mac and remote hosts. No traffic monitor is installed.
+The separate Agent Maintenance macOS app uses this same CLI. It lists local and SSH hosts, filters conversations by project/tool/archive state, backs up selected conversations or a project, previews archive/unarchive/delete and log/temp cleanup, verifies and restores standalone backups, and checks or applies CLI upgrades. Conversation changes and cleanup show a reviewed plan before confirmation. CLI upgrades require explicit confirmation. Build a universal app with desktop/build-app.sh OUTPUT_DIRECTORY using a compatible SDK or complete Xcode installation. Python 3 must be available on the Mac and remote hosts. No traffic monitor is installed.
 
 LEGACY ENTRIES
 install_legacy.py --scripts-dir PATH installs delegates for codex_archives.py and claude_sessions.py while retaining timestamped originals. The Claude delegate preserves --archived and --filter. The Codex delegate starts in the archived-conversation view. legacy_codex_update_server.sh can replace the previous updater beside the installed agent-maintenance launcher; positional SSH aliases still work. It explicitly requests native Codex and Claude upgrades when run. Installing the delegate itself performs no upgrade.
 
-Inspect and maintain local and remote Codex and Claude conversations with Python 3.10+ and OpenSSH. Remote commands stream a small Python engine over SSH; no permanent remote daemon is required. All inventory operations are read-only. Network traffic is not monitored.
+Inspect and maintain local and remote Codex and Claude conversations with Python 3.9+ and OpenSSH. Remote commands stream a small Python engine over SSH; no permanent remote daemon is required. All inventory operations are read-only. Network traffic is not monitored.
 
 INSTALL
   python3 install.py
@@ -14,7 +14,7 @@ INSTALL
   agent-maintenance inspect --host all
   agent-maintenance interactive
 
-Hosts come from ~/.config/agent-maintenance/config.json (a JSON object with a hosts array of SSH aliases), then the existing Agent Speed SSHUsage configuration on macOS. AGENT_MAINTENANCE_HOSTS can supply comma-separated aliases. Without configuration, only local is selected. Explicit --host values always work; repeat --host to select several machines.
+Hosts come from ~/.config/agent-maintenance/config.json (a JSON object with a hosts array of SSH aliases), then the existing Agent Speed SSHUsage configuration on macOS. AGENT_MAINTENANCE_HOSTS can supply comma-separated aliases. Without explicit configuration, literal aliases are discovered from ~/.ssh/config and its Include files. Wildcard and negated Host patterns are excluded. Use Sources & SSH in the desktop app to select aliases and local data homes. Explicit --host values always work; repeat --host to select several machines.
 
 BACK UP A PROJECT OR CONVERSATION
   agent-maintenance projects --host all
@@ -58,3 +58,14 @@ VALIDATION
   python3 validate_native_codex.py
 
 The native validation uses a temporary CODEX_HOME, creates fixture conversations without model calls, and exercises archive, unarchive, and delete. Normal tests cover backup bytes/media/descendants, restoration, changed backup rejection, cleanup scope, and streaming CLI plan/apply. Real server backup tests are read-only. No production deletion is part of validation.
+
+SOURCE DIAGNOSTICS
+  agent-maintenance diagnose --host all
+  agent-maintenance config
+  agent-maintenance config --hosts thor,loki
+  agent-maintenance config --auto-hosts
+  agent-maintenance config --codex-home ~/.codex
+
+Diagnostics show actual data directories, database paths, record counts, and scan errors without conversation content. A guardian-only Codex store is no longer hidden: orphan subagent roots are visible by default, and Include subagents reveals every record. The desktop table labels subagents separately. Environment data-home overrides take precedence over configured paths.
+
+The macOS distribution installer and app share version-aware Python discovery. Python 3.9.6 from macOS developer tools is supported and tested; no separate Python upgrade is needed when that interpreter is available.

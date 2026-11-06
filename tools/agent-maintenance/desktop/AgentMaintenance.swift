@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -12,6 +13,7 @@ struct Conversation: Identifiable {
     let projectKey: String
     let archived: Bool
     let busy: Bool
+    let isSubagent: Bool
     let bytes: Int64
     init(_ value: [String: Any]) {
         uuid = value["id"] as? String ?? ""
@@ -19,9 +21,10 @@ struct Conversation: Identifiable {
         id = tool + ":" + uuid
         title = value["title"] as? String ?? uuid
         project = value["project"] as? String ?? ""
-        projectKey = value["project_id"] as? String ?? value["project_path"] as? String ?? value["cwd"] as? String ?? project
+        projectKey = value["project_path"] as? String ?? value["cwd"] as? String ?? value["project_id"] as? String ?? project
         archived = value["archived"] as? Bool ?? false
         busy = value["busy"] as? Bool ?? false
+        isSubagent = value["is_subagent"] as? Bool ?? false
         bytes = (value["bytes"] as? NSNumber)?.int64Value ?? 0
     }
 }
@@ -33,14 +36,25 @@ private struct CLIError: LocalizedError {
 
 private enum CLI {
     static func execute(_ arguments: [String]) throws -> [String: Any] {
-        let files = FileManager.default
-        let candidates = [ProcessInfo.processInfo.environment["AGENT_MAINTENANCE_PYTHON"],
-                          "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
-                          "/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"].compactMap { $0 }
-        guard let python = candidates.first(where: { files.isExecutableFile(atPath: $0) }),
-              let root = Bundle.main.resourceURL?.appendingPathComponent("CLI") else {
-            throw CLIError(message: "Python 3 and the bundled maintenance CLI are required.")
+        guard let root = Bundle.main.resourceURL?.appendingPathComponent("CLI") else {
+            throw CLIError(message: "The bundled maintenance CLI is missing.")
         }
+        let finder = Process()
+        finder.executableURL = URL(fileURLWithPath: "/bin/bash")
+        finder.arguments = [root.appendingPathComponent("find-python.sh").path]
+        let found = Pipe()
+        let finderErrors = Pipe()
+        finder.standardOutput = found
+        finder.standardError = finderErrors
+        try finder.run()
+        let path = found.fileHandleForReading.readDataToEndOfFile()
+        let problem = finderErrors.fileHandleForReading.readDataToEndOfFile()
+        finder.waitUntilExit()
+        guard finder.terminationStatus == 0, let value = String(data: path, encoding: .utf8),
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CLIError(message: String(data: problem, encoding: .utf8) ?? "Python 3.9+ is required.")
+        }
+        let python = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: python)
         process.arguments = [root.appendingPathComponent("agent_maintenance.py").path, "--json"] + arguments
@@ -80,6 +94,16 @@ final class MaintenanceModel: ObservableObject {
     @Published var confirmation = false
     @Published var confirmationText = ""
     @Published var cleanupDays = 30
+    @Published var includeSubagents = false
+    @Published var showSources = false
+    @Published var autoHosts = true
+    @Published var hostDraft = ""
+    @Published var codexDraft = ""
+    @Published var claudeDraft = ""
+    @Published var discoveredHosts: [String] = []
+    @Published var sourceSummary = "Loading data sources"
+    @Published var sourceDetail = ""
+    @Published var scanNotice = ""
     private var pendingPlan: URL?
     private var pendingID: String?
     private var pendingUpgrade = false
@@ -99,19 +123,81 @@ final class MaintenanceModel: ObservableObject {
     var selectedRows: [Conversation] { visible.filter { selection.contains($0.id) } }
 
     func start() {
-        run(["hosts"], label: "Loading hosts") { result in
-            self.hosts = result["hosts"] as? [String] ?? ["local"]
+        run(["config"], label: "Finding SSH hosts and local sources") { result in
+            self.readConfiguration(result)
             self.refresh()
         }
     }
     func refresh() {
+        guard !busy else { return }
         selection = []
         conversations = []
         project = ""
-        run(["sessions", "--host", host], label: "Reading " + host) { result in
+        var arguments = ["sessions", "--host", host]
+        if includeSubagents { arguments += ["--include-subagents"] }
+        run(arguments, label: "Reading " + host) { result in
             let machines = result["hosts"] as? [[String: Any]] ?? []
             self.conversations = (machines.first?["sessions"] as? [[String: Any]] ?? []).map(Conversation.init)
+            if let diagnostics = machines.first?["diagnostics"] as? [String: Any] {
+                self.readDiagnostics(diagnostics)
+            }
             self.status = "\(self.host): \(self.conversations.count) conversations"
+        }
+    }
+    private func readConfiguration(_ value: [String: Any]) {
+        hosts = value["hosts"] as? [String] ?? ["local"]
+        if !hosts.contains(host) { host = "local" }
+        discoveredHosts = value["discovered_ssh_hosts"] as? [String] ?? []
+        autoHosts = !(value["explicit_hosts"] as? Bool ?? false)
+        hostDraft = hosts.filter { $0 != "local" }.joined(separator: "\n")
+        let roots = value["configured_data_roots"] as? [String: String] ?? [:]
+        codexDraft = roots["codex"] ?? ""
+        claudeDraft = roots["claude"] ?? ""
+        if host == "local", let diagnostics = value["local_diagnostics"] as? [String: Any] { readDiagnostics(diagnostics) }
+    }
+    private func readDiagnostics(_ value: [String: Any]) {
+        let codex = value["codex"] as? [String: Any] ?? [:]
+        let claude = value["claude"] as? [String: Any] ?? [:]
+        let codexCount = codex["total_records"] as? Int ?? 0
+        let claudeCount = claude["total_records"] as? Int ?? 0
+        sourceSummary = "Codex: \(codexCount) records  ·  Claude: \(claudeCount) records"
+        sourceDetail = "Codex: \(codex["root"] as? String ?? "Unknown")\nClaude: \(claude["root"] as? String ?? "Unknown")"
+        let errors = value["errors"] as? [[String: Any]] ?? []
+        if !errors.isEmpty {
+            scanNotice = errors.compactMap { $0["error"] as? String }.joined(separator: "; ")
+        } else if codexCount == 0 {
+            scanNotice = "No Codex records found at \(codex["root"] as? String ?? "the selected directory"). Check Sources & SSH."
+        } else if (codex["subagent_records"] as? Int ?? 0) == codexCount && codexCount > 0 {
+            scanNotice = "This host contains Codex subagent records only. Orphan records are listed; Include subagents shows every record."
+        } else if (codex["visible_records"] as? Int ?? 0) == 0 && !includeSubagents {
+            scanNotice = "Codex records are present. Enable Include subagents to show records hidden by the conversation filter."
+        } else {
+            scanNotice = ""
+        }
+    }
+    func openSources() {
+        run(["config"], label: "Reading source settings") { result in
+            self.readConfiguration(result)
+            self.showSources = true
+        }
+    }
+    func saveSources() {
+        var arguments = ["config", "--codex-home", codexDraft, "--claude-home", claudeDraft]
+        arguments += autoHosts ? ["--auto-hosts"] : ["--hosts", hostDraft]
+        run(arguments, label: "Saving source settings") { result in
+            self.readConfiguration(result)
+            self.showSources = false
+            self.refresh()
+        }
+    }
+    func chooseDirectory(codex: Bool) {
+        let panel = NSOpenPanel()
+        panel.title = codex ? "Choose the Codex data home" : "Choose the Claude data home"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.showsHiddenFiles = true
+        if panel.runModal() == .OK, let path = panel.url?.path {
+            if codex { codexDraft = path } else { claudeDraft = path }
         }
     }
     private func run(_ arguments: [String], label: String, completed: (([String: Any]) -> Void)? = nil) {
@@ -228,9 +314,21 @@ struct MaintenanceView: View {
                 }.frame(width: 230)
                 Button("Refresh", action: model.refresh)
                 Button("Inspect storage", action: model.inspect)
+                Button("Sources & SSH", action: model.openSources)
                 Spacer()
                 if model.busy { ProgressView().controlSize(.small) }
                 Text(model.status).font(.callout).foregroundStyle(.secondary)
+            }
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.sourceSummary).font(.callout.weight(.medium))
+                    Text(model.sourceDetail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    if !model.scanNotice.isEmpty {
+                        Text(model.scanNotice).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+                    }
+                }
+                Spacer()
+                Toggle("Include subagents", isOn: $model.includeSubagents).toggleStyle(.checkbox)
             }
             HStack {
                 Picker("Project", selection: $model.project) {
@@ -249,6 +347,7 @@ struct MaintenanceView: View {
                 TableColumn("Tool", value: \.tool).width(65)
                 TableColumn("Conversation", value: \.title).width(min: 200)
                 TableColumn("Project", value: \.project).width(min: 90, ideal: 150)
+                TableColumn("Kind") { row in Text(row.isSubagent ? "Subagent" : "Conversation") }.width(95)
                 TableColumn("State") { row in Text(row.busy ? "Recently active" : row.archived ? "Archived" : "Active") }.width(110)
                 TableColumn("Transcript") { row in Text(MaintenanceModel.size(row.bytes)).monospacedDigit() }.width(100)
             }.frame(minHeight: 240)
@@ -279,6 +378,8 @@ struct MaintenanceView: View {
         .padding(18).frame(minWidth: 1040, minHeight: 700)
         .disabled(model.busy)
         .onChange(of: model.host) { model.refresh() }
+        .onChange(of: model.includeSubagents) { model.refresh() }
+        .sheet(isPresented: $model.showSources) { SourceSettingsView(model: model) }
         .alert("Apply this maintenance action?", isPresented: $model.confirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Apply", action: model.applyConfirmed)
@@ -287,8 +388,71 @@ struct MaintenanceView: View {
     }
 }
 
+private struct SourceSettingsView: View {
+    @ObservedObject var model: MaintenanceModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Sources & SSH").font(.title2.weight(.semibold))
+            if model.status == "Needs attention" {
+                Text(model.report).font(.caption).foregroundStyle(.orange).lineLimit(5).textSelection(.enabled)
+            }
+            Toggle("Discover hosts automatically from SSH and existing Agent Speed settings", isOn: $model.autoHosts)
+            Text("Selected SSH aliases (one per line)").font(.callout.weight(.medium))
+            TextEditor(text: $model.hostDraft).font(.system(.body, design: .monospaced))
+                .frame(height: 100).border(Color.secondary.opacity(0.3)).disabled(model.autoHosts)
+            HStack {
+                Text("Detected: " + (model.discoveredHosts.isEmpty ? "No literal aliases in ~/.ssh/config" : model.discoveredHosts.joined(separator: ", ")))
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Use detected hosts") {
+                    model.hostDraft = model.discoveredHosts.joined(separator: "\n")
+                    model.autoHosts = false
+                }
+            }
+            Text("Local data homes").font(.callout.weight(.medium))
+            HStack {
+                TextField("Codex home (default: ~/.codex)", text: $model.codexDraft).textFieldStyle(.roundedBorder)
+                Button("Choose") { model.chooseDirectory(codex: true) }
+            }
+            HStack {
+                TextField("Claude home (default: ~/.claude)", text: $model.claudeDraft).textFieldStyle(.roundedBorder)
+                Button("Choose") { model.chooseDirectory(codex: false) }
+            }
+            Text("Leave a data home empty to use its default. Environment overrides take precedence. SSH credentials stay in your existing SSH configuration.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Button("Cancel") { model.showSources = false }
+                Spacer()
+                if model.busy { ProgressView().controlSize(.small) }
+                Button("Save", action: model.saveSources).buttonStyle(.borderedProminent).disabled(model.busy)
+            }
+        }.padding(24).frame(width: 640)
+    }
+}
+
 @main
 struct AgentMaintenanceApp: App {
+    init() {
+        if CommandLine.arguments.contains("--self-check") {
+            do {
+                let configuration = try CLI.execute(["config"])
+                let diagnostics = configuration["local_diagnostics"] as? [String: Any] ?? [:]
+                let report: [String: Any] = [
+                    "hosts": configuration["hosts"] as? [String] ?? [],
+                    "python": configuration["python"] as? String ?? "",
+                    "codex": diagnostics["codex"] as? [String: Any] ?? [:],
+                    "claude": diagnostics["claude"] as? [String: Any] ?? [:],
+                    "iconBundled": Bundle.main.url(forResource: "AgentMaintenance", withExtension: "icns") != nil,
+                ]
+                let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+                print(String(decoding: data, as: UTF8.self))
+                Darwin.exit(0)
+            } catch {
+                FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+                Darwin.exit(1)
+            }
+        }
+    }
     var body: some Scene {
         WindowGroup("Agent Maintenance") { MaintenanceView() }
             .defaultSize(width: 1180, height: 780)
