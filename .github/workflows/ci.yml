@@ -61,10 +61,20 @@ jobs:
         run: macos/scripts/build-app.sh
       - name: Verify custom build protection
         run: python3 macos/scripts/test-custom-build.py "dist/Agent Speed.app"
+      - name: Build maintenance desktop app
+        run: |
+          tools/agent-maintenance/desktop/build-app.sh "$RUNNER_TEMP/agent-maintenance"
+          cp "$RUNNER_TEMP/agent-maintenance/AgentMaintenance-macOS.zip" dist/
       - uses: actions/upload-artifact@v7
         with:
           name: AgentSpeed-macOS
           path: dist/AgentSpeed-macOS.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: AgentMaintenance-macOS
+          path: dist/AgentMaintenance-macOS.zip
           if-no-files-found: error
 
   windows:

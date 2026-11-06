@@ -1,5 +1,11 @@
 Agent Maintenance 0.1.0
 
+DESKTOP APP
+The separate Agent Maintenance macOS app uses this same CLI. It lists local and SSH hosts, filters conversations by project/tool/archive state, backs up selected conversations or a project, previews archive/unarchive/delete and log/temp cleanup, verifies and restores standalone backups, and checks or applies CLI upgrades. Every mutation shows a reviewed plan before confirmation. Build a universal app with desktop/build-app.sh OUTPUT_DIRECTORY using a compatible SDK or complete Xcode installation. Python 3 must be available on the Mac and remote hosts. No traffic monitor is installed.
+
+LEGACY ENTRIES
+install_legacy.py --scripts-dir PATH installs delegates for codex_archives.py and claude_sessions.py while retaining timestamped originals. The Claude delegate preserves --archived and --filter. The Codex delegate starts in the archived-conversation view. legacy_codex_update_server.sh can replace the previous updater beside the installed agent-maintenance launcher; positional SSH aliases still work. It explicitly requests native Codex and Claude upgrades when run. Installing the delegate itself performs no upgrade.
+
 Inspect and maintain local and remote Codex and Claude conversations with Python 3.10+ and OpenSSH. Remote commands stream a small Python engine over SSH; no permanent remote daemon is required. All inventory operations are read-only. Network traffic is not monitored.
 
 INSTALL

@@ -26,6 +26,8 @@ jobs:
       - name: Merge upstream into a local candidate
         id: merge
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
@@ -34,7 +36,13 @@ jobs:
           git fetch --no-tags upstream main
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
-            echo 'Upstream main is already included; rebuilding the current custom app.' >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+              echo 'build=true' >> "$GITHUB_OUTPUT"
+              echo 'Upstream main is already included; manually rebuilding the current custom app.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'build=false' >> "$GITHUB_OUTPUT"
+              echo 'No upstream changes; the installed custom source remains current.' >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
             git merge --no-edit --no-ff upstream/main || {
               echo '::error::Upstream merge conflicts require review. Fork main was left unchanged.'
@@ -42,28 +50,35 @@ jobs:
               exit 1
             }
             echo 'changed=true' >> "$GITHUB_OUTPUT"
+            echo 'build=true' >> "$GITHUB_OUTPUT"
           fi
       - name: Select newest stable Xcode
+        if: steps.merge.outputs.build == 'true'
         run: |
           xcode="$(ls -d /Applications/Xcode*.app | grep -viE 'beta|_rc|release_candidate' | sort -V | tail -1)"
           sudo xcode-select -s "$xcode"
           xcodebuild -version
       - name: Verify upstream contracts
+        if: steps.merge.outputs.build == 'true'
         run: |
           python3 spec/tools/report_reference.py
           python3 spec/tools/execution_modes_reference.py
           python3 spec/tools/test_reporting_extensions.py
       - name: Test native app and SSH cache safety
+        if: steps.merge.outputs.build == 'true'
         run: |
           swift test --package-path macos
           python3 -m unittest discover -s macos/Tests/SSHUsageHelperTests -v
           python3 -m unittest discover -s tools/agent-maintenance -p test_maintenance.py -v
           python3 macos/scripts/test-update-relaunch.py
       - name: Build and verify custom app
+        if: steps.merge.outputs.build == 'true'
         run: |
           macos/scripts/build-app.sh --custom-build --build "${GITHUB_RUN_NUMBER}.0"
           python3 macos/scripts/test-custom-build.py "dist/Agent Speed.app"
-          shasum -a 256 dist/AgentSpeed-macOS.zip > dist/SHA256SUMS.txt
+          tools/agent-maintenance/desktop/build-app.sh "$RUNNER_TEMP/agent-maintenance"
+          cp "$RUNNER_TEMP/agent-maintenance/AgentMaintenance-macOS.zip" dist/
+          (cd dist && shasum -a 256 AgentSpeed-macOS.zip AgentMaintenance-macOS.zip) > dist/SHA256SUMS.txt
           git rev-parse HEAD > dist/SOURCE_COMMIT.txt
       - name: Advance fork main after successful validation
         if: steps.merge.outputs.changed == 'true'
@@ -75,10 +90,12 @@ jobs:
           git push origin HEAD:refs/heads/main
           echo "Merged and validated $(git rev-parse HEAD)." >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
+        if: steps.merge.outputs.build == 'true'
         with:
           name: AgentSpeed-custom-macOS-${{ github.run_number }}
           path: |
             dist/AgentSpeed-macOS.zip
+            dist/AgentMaintenance-macOS.zip
             dist/SHA256SUMS.txt
             dist/SOURCE_COMMIT.txt
           if-no-files-found: error

@@ -6,6 +6,7 @@
 /.claude/
 /request.md
 __pycache__/
+.build-cache/
 
 # Partner documents for live reporting services, kept local and sent to partners directly
 /spec/REPORTING.md
