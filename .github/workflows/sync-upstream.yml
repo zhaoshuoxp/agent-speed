@@ -78,8 +78,10 @@ jobs:
           python3 macos/scripts/test-custom-build.py "dist/Agent Speed.app"
           tools/agent-maintenance/desktop/build-app.sh "$RUNNER_TEMP/agent-maintenance"
           /usr/bin/python3 tools/agent-maintenance/desktop/verify-app.py "$RUNNER_TEMP/agent-maintenance/Agent Maintenance.app" --python /usr/bin/python3
+          /usr/bin/python3 tools/agent-maintenance/package-distribution.py "$RUNNER_TEMP/agent-maintenance/AgentMaintenance-macOS.zip" "$RUNNER_TEMP/maintenance-distribution"
           cp "$RUNNER_TEMP/agent-maintenance/AgentMaintenance-macOS.zip" dist/
-          (cd dist && shasum -a 256 AgentSpeed-macOS.zip AgentMaintenance-macOS.zip) > dist/SHA256SUMS.txt
+          cp "$RUNNER_TEMP/maintenance-distribution/"*.zip dist/
+          (cd dist && shasum -a 256 *.zip) > dist/SHA256SUMS.txt
           git rev-parse HEAD > dist/SOURCE_COMMIT.txt
       - name: Advance fork main after successful validation
         if: steps.merge.outputs.changed == 'true'
@@ -97,6 +99,7 @@ jobs:
           path: |
             dist/AgentSpeed-macOS.zip
             dist/AgentMaintenance-macOS.zip
+            dist/AgentMaintenance-Test-*-macOS.zip
             dist/SHA256SUMS.txt
             dist/SOURCE_COMMIT.txt
           if-no-files-found: error

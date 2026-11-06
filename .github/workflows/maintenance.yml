@@ -42,8 +42,16 @@ jobs:
         run: |
           tools/agent-maintenance/desktop/build-app.sh "$RUNNER_TEMP/maintenance-app"
           /usr/bin/python3 tools/agent-maintenance/desktop/verify-app.py "$RUNNER_TEMP/maintenance-app/Agent Maintenance.app" --python /usr/bin/python3
+      - name: Package and smoke-test installer with system Python
+        run: |
+          /usr/bin/python3 tools/agent-maintenance/package-distribution.py "$RUNNER_TEMP/maintenance-app/AgentMaintenance-macOS.zip" "$RUNNER_TEMP/distribution"
+          package="$(find "$RUNNER_TEMP/distribution" -maxdepth 1 -type d -name 'AgentMaintenance-Test-*' | head -1)"
+          AGENT_MAINTENANCE_PYTHON=/usr/bin/python3 bash "$package/Install.command" --app-dir "$RUNNER_TEMP/install-check/Applications" --cli-prefix "$RUNNER_TEMP/install-check/CLI" --bin-dir "$RUNNER_TEMP/install-check/bin"
       - uses: actions/upload-artifact@v7
         with:
           name: AgentMaintenance-macOS
-          path: ${{ runner.temp }}/maintenance-app/AgentMaintenance-macOS.zip
+          path: |
+            ${{ runner.temp }}/maintenance-app/AgentMaintenance-macOS.zip
+            ${{ runner.temp }}/distribution/*.zip
+            ${{ runner.temp }}/distribution/*.sha256
           if-no-files-found: error
