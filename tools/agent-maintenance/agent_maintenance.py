@@ -17,8 +17,9 @@ import subprocess
 import sys
 import time
 import zipfile
+import host as maintenance_engine
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 ENGINE = Path(__file__).with_name("host.py")
 SSH_OPTIONS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
                "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no", "-o", "ControlMaster=no",
@@ -147,7 +148,8 @@ def configure(args):
             temporary.unlink(missing_ok=True)
     return {**host_configuration(), "explicit_hosts": "hosts" in settings,
             "configured_data_roots": settings.get("data_roots", {}), "python": sys.executable,
-            "local_diagnostics": invoke("local", {"action": "diagnostics"})}
+            "local_diagnostics": invoke("local", {"action": "diagnostics"},
+                                        progress=print_progress if args.progress else None)}
 
 
 def size(value):
@@ -157,11 +159,16 @@ def size(value):
         value /= 1000
 
 
-def digest_file(path):
+def digest_file(path, progress=None):
     value = hashlib.sha256()
+    count, last_report = 0, time.monotonic()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             value.update(block)
+            count += len(block)
+            if progress and time.monotonic() - last_report >= 1:
+                progress("Archive checksum: " + size(count) + " read")
+                last_report = time.monotonic()
     return value.hexdigest()
 
 
@@ -170,16 +177,68 @@ def command(host, request):
     environment = dict(os.environ)
     environment["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + environment.get("PATH", "")
     if host == "local":
-        return [sys.executable, str(ENGINE), payload], None, environment
+        return [sys.executable, "-u", str(ENGINE), payload], None, environment
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", host):
         raise ValueError("Invalid SSH host alias")
-    script = 'export PATH="$HOME/.local/bin:$PATH"; exec python3 - ' + payload
+    script = 'export PATH="$HOME/.local/bin:$PATH"; exec python3 -u - ' + payload
     return ["/usr/bin/ssh", *SSH_OPTIONS, host, "bash -lc " + shlex.quote(script)], ENGINE.read_bytes(), environment
 
 
-def invoke(host, request, timeout=120):
+def print_progress(host, tool, message):
+    message = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", message)
+    message = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", message)
+    label = host + ("/" + tool if tool else "")
+    for line in message.replace("\r", "\n").splitlines():
+        if line.strip():
+            sys.stderr.write("[" + label + "] " + line + "\n")
+            sys.stderr.flush()
+
+
+class ProgressReader:
+    def __init__(self, host, progress):
+        self.host = host
+        self.progress = progress
+        self.pending = bytearray()
+
+    def line(self, data):
+        text = data.decode(errors="replace")
+        prefix = "AGENT_MAINTENANCE_EVENT "
+        if text.startswith(prefix):
+            event = json.loads(text[len(prefix):])
+            self.progress(self.host, event.get("tool", ""), event.get("message", ""))
+        elif text.strip():
+            self.progress(self.host, "", text)
+
+    def __call__(self, channel, chunk):
+        if channel != "stderr":
+            return
+        self.pending.extend(chunk)
+        while b"\n" in self.pending:
+            line, _, rest = self.pending.partition(b"\n")
+            self.pending = bytearray(rest)
+            self.line(line)
+        if len(self.pending) > (1 << 20):
+            self.line(self.pending)
+            self.pending.clear()
+
+    def finish(self):
+        if self.pending:
+            self.line(self.pending)
+            self.pending.clear()
+
+
+def invoke(host, request, timeout=120, progress=None):
+    if progress:
+        request = {**request, "progress": True}
+        progress(host, "", "Running " + request.get("action", "inventory"))
     arguments, source, environment = command(host, request)
-    result = subprocess.run(arguments, input=source, env=environment, capture_output=True, timeout=timeout)
+    if progress:
+        reader = ProgressReader(host, progress)
+        result = maintenance_engine.stream_process(arguments, environment=environment, input_data=source,
+                                                   timeout=timeout, output=reader)
+        reader.finish()
+    else:
+        result = subprocess.run(arguments, input=source, env=environment, capture_output=True, timeout=timeout)
     prefix = "AGENT_MAINTENANCE_JSON "
     for line in result.stdout.decode(errors="replace").splitlines():
         if line.startswith(prefix):
@@ -190,11 +249,12 @@ def invoke(host, request, timeout=120):
     raise RuntimeError(result.stderr.decode(errors="replace").strip()[-1500:] or "No valid maintenance response")
 
 
-def gather(hosts, request, timeout=120):
+def gather(hosts, request, timeout=120, progress=None):
     results, failures = {}, []
     workers = 1 if request.get("action") == "versions" and request.get("apply") else min(5, len(hosts))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(invoke, host, request, timeout): host for host in hosts}
+        options = {"progress": progress} if progress else {}
+        futures = {executor.submit(invoke, host, request, timeout, **options): host for host in hosts}
         for future in concurrent.futures.as_completed(futures):
             host = futures[future]
             try:
@@ -204,6 +264,8 @@ def gather(hosts, request, timeout=120):
                         failures.append({"host": host, "tool": tool["tool"], "error": tool["error"]})
             except Exception as error:
                 failures.append({"host": host, "error": str(error)})
+                if progress:
+                    progress(host, "", "Failed: " + str(error))
     return {"hosts": [{"host": host, **results[host]} for host in hosts if host in results], "failures": failures}
 
 
@@ -228,7 +290,7 @@ def safe_member(name):
         raise ValueError("Unsafe backup member: " + name)
 
 
-def verify_backup(path, progress=False):
+def verify_backup(path, progress=None):
     path = Path(path).expanduser().resolve()
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -243,17 +305,26 @@ def verify_backup(path, progress=False):
         if len(records) != len(manifest["files"]) or set(records) | {"manifest.json"} != set(names):
             raise ValueError("The backup does not match its manifest")
         for name, item in records.items():
+            if progress:
+                progress("Verifying " + name)
             safe_member(name)
             info = archive.getinfo(name)
             if stat_mode(info) == 0o120000 or info.file_size != item["size"]:
                 raise ValueError("A backup member has an invalid type or size")
             value = hashlib.sha256()
+            count, last_report = 0, time.monotonic()
             with archive.open(name) as source:
                 for block in iter(lambda: source.read(1 << 20), b""):
                     value.update(block)
+                    count += len(block)
+                    if progress and time.monotonic() - last_report >= 1:
+                        progress(name + ": " + size(count) + "/" + size(item["size"]))
+                        last_report = time.monotonic()
             if value.hexdigest() != item["sha256"]:
                 raise ValueError("Backup checksum mismatch: " + name)
-    return {"path": str(path), "sha256": digest_file(path), "sessions": len(manifest["sessions"]),
+    if progress:
+        progress("Verifying archive checksum")
+    return {"path": str(path), "sha256": digest_file(path, progress), "sessions": len(manifest["sessions"]),
             "members": len(records), "bytes": path.stat().st_size, "manifest": manifest,
             "verified": True, "restore_mode": manifest.get("restore_mode", "standalone-files")}
 
@@ -262,7 +333,7 @@ def stat_mode(info):
     return (info.external_attr >> 16) & 0o170000
 
 
-def stream_backup(host, selection, destination):
+def stream_backup(host, selection, destination, progress=None):
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
         raise ValueError("The backup destination already exists")
@@ -270,48 +341,61 @@ def stream_backup(host, selection, destination):
     temporary = destination.with_name(destination.name + ".partial")
     if temporary.exists():
         raise ValueError("An incomplete backup already occupies the destination")
-    arguments, source, environment = command(host, {"action": "backup", "selector": selection})
-    with contextlib.ExitStack() as stack:
-        error_log = stack.enter_context(open(destination.with_name(destination.name + ".log"), "xb"))
-        process = subprocess.Popen(arguments, stdin=subprocess.PIPE if source else subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=error_log, env=environment)
-        stack.callback(process.stdout.close)
-        if source:
-            process.stdin.write(source)
-            process.stdin.close()
-        found = False
-        for _ in range(100):
-            line = process.stdout.readline(65536)
-            if line == b"AGENT_MAINTENANCE_BACKUP\n":
-                found = True
-                break
-            if not line:
-                break
-        if not found:
-            process.wait(timeout=30)
-            raise RuntimeError("Backup did not start; inspect " + str(destination.with_name(destination.name + ".log")))
-        with open(temporary, "xb") as output:
-            shutil.copyfileobj(process.stdout, output, 1 << 20)
-        status = process.wait(timeout=60)
-    if status:
+    request = {"action": "backup", "selector": selection, "progress": bool(progress)}
+    arguments, source, environment = command(host, request)
+    reader = ProgressReader(host, progress) if progress else None
+    pending, found = bytearray(), False
+    with open(destination.with_name(destination.name + ".log"), "xb") as error_log, open(temporary, "xb") as output:
+        def receive(channel, chunk):
+            nonlocal found
+            if channel == "stderr":
+                error_log.write(chunk)
+                if reader:
+                    reader(channel, chunk)
+            elif found:
+                output.write(chunk)
+            else:
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    line, _, rest = pending.partition(b"\n")
+                    pending[:] = rest
+                    if line == b"AGENT_MAINTENANCE_BACKUP":
+                        found = True
+                        output.write(pending)
+                        pending.clear()
+                        break
+                if len(pending) > 65536:
+                    raise RuntimeError("Backup stream did not provide its header")
+        result = maintenance_engine.stream_process(arguments, environment=environment, input_data=source,
+                                                   timeout=86400, output=receive, stdout_limit=0)
+        if reader:
+            reader.finish()
+    if not found:
+        raise RuntimeError("Backup did not start; inspect " + str(destination.with_name(destination.name + ".log")))
+    if result.returncode:
         raise RuntimeError("Backup failed; the partial file and log were retained for review")
-    proof = verify_backup(temporary)
+    verify_progress = (lambda message: progress(host, "backup", message)) if progress else None
+    proof = verify_backup(temporary, verify_progress)
     temporary.replace(destination)
     proof["path"] = str(destination)
     receipt = {key: value for key, value in proof.items() if key != "manifest"}
     receipt["host"] = host
     destination.with_suffix(".verified.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    if progress:
+        progress(host, "backup", "Backup verified: " + str(destination))
     return receipt
 
 
-def restore_files(backup, destination):
-    proof = verify_backup(backup)
+def restore_files(backup, destination, progress=None):
+    proof = verify_backup(backup, progress)
     destination = Path(destination).expanduser().resolve()
     if destination.exists():
         raise ValueError("Choose a new, empty restore directory")
     destination.mkdir(parents=True, mode=0o700)
     with zipfile.ZipFile(backup) as archive:
         for item in archive.infolist():
+            if progress:
+                progress("Restoring " + item.filename)
             safe_member(item.filename)
             target = destination / item.filename
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -328,6 +412,8 @@ def common(parser, root=False):
                         help="Host alias; repeat for multiple hosts, or use all configured hosts")
     parser.add_argument("--json", action="store_true", default=False if root else argparse.SUPPRESS,
                         help="Print structured JSON for automation and desktop clients")
+    parser.add_argument("--progress", action="store_true", default=False if root else argparse.SUPPRESS,
+                        help="Stream operation progress to stderr while retaining structured stdout")
 
 
 def selection_arguments(parser):
@@ -379,7 +465,7 @@ def parser():
     common(child)
     selection_arguments(child)
     child.add_argument("operation", choices=("archive", "unarchive", "delete", "cleanup"))
-    child.add_argument("--backup", type=Path, help="Verified backup for archive; not required for delete")
+    child.add_argument("--backup", type=Path, help="Optional legacy argument; archive and delete use manual backups")
     child.add_argument("--category", choices=("logs", "temp"), action="append")
     child.add_argument("--older-than", type=int, default=30, metavar="DAYS")
     child.add_argument("--output", type=Path, required=True)
@@ -448,14 +534,10 @@ def interactive(args):
             if destination:
                 main(["backup", *base, *scope, "--output", str(Path(destination).expanduser())])
             continue
-        proof = []
-        if operation == "archive":
-            backup = input("Existing verified backup ZIP path: ").strip()
-            proof = ["--backup", str(Path(backup).expanduser())]
         directory = Path.home() / ".local/state/agent-maintenance/plans"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         plan_path = directory / (str(__import__("time").time_ns()) + ".json")
-        if main(["plan", operation, *base, *scope, *proof, "--output", str(plan_path)]) != 0:
+        if main(["plan", operation, *base, *scope, "--output", str(plan_path)]) != 0:
             continue
         reviewed = json.loads(plan_path.read_text())["plan"]
         confirmation = input("Type the full plan ID to apply, or press Enter to cancel: ").strip()
@@ -493,7 +575,7 @@ def output_result(value, args):
         print(f"Conversations: {len(plan['sessions'])}; files: {len(plan['items'])}; size: {size(plan['bytes'])}")
         for row in plan["sessions"]:
             print(f"  {row['tool']} {row['id']}  {row['title'][:90]}")
-        print("Archive preserves transcript size. Manage any deletion backups separately.")
+        print("Archive preserves transcript size. Backups are managed separately.")
         print("Plan saved: " + str(args.output.resolve()))
         print("Apply: agent-maintenance apply " + shlex.quote(str(args.output.resolve())) + " --confirm " + plan["plan_id"])
     else:
@@ -504,17 +586,18 @@ def main(argv=None):
     os.umask(0o077)
     args = parser().parse_args(argv)
     try:
+        progress = print_progress if args.progress else None
         hosts = host_names(args) if args.command not in ("config", "hosts", "verify", "restore-files", "apply") else ["local"]
         if args.command == "hosts":
             result = host_configuration()
         elif args.command == "config":
             result = configure(args)
         elif args.command == "diagnose":
-            result = gather(hosts, {"action": "diagnostics"})
+            result = gather(hosts, {"action": "diagnostics"}, progress=progress)
         elif args.command == "interactive":
             return interactive(args)
         elif args.command in ("inspect", "sessions", "projects"):
-            result = gather(hosts, {"action": "inventory", "storage": args.command == "inspect"})
+            result = gather(hosts, {"action": "inventory", "storage": args.command == "inspect"}, progress=progress)
             if args.command != "inspect":
                 for host in result["hosts"]:
                     host["sessions"] = selected(host, args, expand=args.command == "projects")
@@ -535,7 +618,7 @@ def main(argv=None):
                 raise ValueError("Choose --project, --session, or --all")
             for host in hosts:
                 try:
-                    data = invoke(host, {"action": "inventory"})
+                    data = invoke(host, {"action": "inventory"}, progress=progress)
                     if not selected(data, args, expand=True):
                         continue
                     destination = args.output
@@ -543,25 +626,22 @@ def main(argv=None):
                         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                         destination = destination / (stamp + "-" + host + ".zip")
                     print("Backing up " + host + " to " + str(destination), file=sys.stderr, flush=True)
-                    result["backups"].append(stream_backup(host, selector(args), destination))
+                    result["backups"].append(stream_backup(host, selector(args), destination, progress))
                 except Exception as error:
                     result["failures"].append({"host": host, "error": str(error)})
             if not result["backups"] and not result["failures"]:
                 raise ValueError("No conversations match the selection")
         elif args.command == "verify":
-            proof = verify_backup(args.backup)
+            proof = verify_backup(args.backup, (lambda text: progress("local", "backup", text)) if progress else None)
             result = {key: value for key, value in proof.items() if key != "manifest"}
         elif args.command == "restore-files":
-            result = restore_files(args.backup, args.output)
+            result = restore_files(args.backup, args.output, (lambda text: progress("local", "restore", text)) if progress else None)
         elif args.command == "plan":
             if len(hosts) != 1:
                 raise ValueError("Select one --host for each reviewed maintenance plan")
-            proof = verify_backup(args.backup) if args.backup and args.operation == "archive" else None
             request = {"action": "plan", "operation": args.operation, "selector": selector(args),
                        "categories": args.category, "days": args.older_than}
-            if proof:
-                request.update(backup_proof=proof["manifest"], backup_sha256=proof["sha256"], backup_path=proof["path"])
-            plan = invoke(hosts[0], request, timeout=3600)
+            plan = invoke(hosts[0], request, timeout=3600, progress=progress)
             result = {"format": "agent-maintenance-client-plan", "host": hosts[0], "plan": plan}
             args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with args.output.open("x") as handle:
@@ -573,15 +653,10 @@ def main(argv=None):
                 raise ValueError("Unsupported maintenance plan")
             plan = wrapper["plan"]
             request = {"action": "apply", "plan": plan, "confirm": args.confirm}
-            if plan["operation"] == "archive" and plan.get("backup_path"):
-                proof = verify_backup(Path(plan["backup_path"]))
-                if proof["sha256"] != plan["backup_sha256"]:
-                    raise ValueError("The reviewed backup changed")
-                request["verified_backup_sha256"] = proof["sha256"]
-            result = invoke(wrapper["host"], request, timeout=3600)
+            result = invoke(wrapper["host"], request, timeout=3600, progress=progress)
         else:
             result = gather(hosts, {"action": "versions", "tool": args.tool, "check_latest": True, "apply": args.apply},
-                            timeout=1200 if args.apply else 90)
+                            timeout=2100 if args.apply else 90, progress=progress)
         output_result(result, args)
         return 1 if result.get("failures") or result.get("all_verified") is False else 0
     except Exception as error:

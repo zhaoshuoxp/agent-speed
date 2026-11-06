@@ -174,45 +174,39 @@ class MaintenanceTests(unittest.TestCase):
         client.restore_files(proof["path"], restored)
         self.assertEqual((restored / entry["name"]).read_bytes(), self.payloads[PARENT].read_bytes())
 
-    def test_claude_archive_requires_backup_and_delete_uses_manual_backups(self):
+    def test_claude_archive_restore_and_delete_use_manual_backups(self):
         proof = self.make_backup({"sessions": [CLAUDE], "tool": "claude"})
-        request = {"operation": "archive", "selector": {"sessions": [CLAUDE], "tool": "claude"},
-                   "backup_sha256": proof["sha256"], "backup_path": proof["path"], "backup_proof": proof["manifest"]}
+        request = {"operation": "archive", "selector": {"sessions": [CLAUDE], "tool": "claude"}}
         plan = host.make_plan(request)
-        result = host.apply_plan({"plan": plan, "confirm": plan["plan_id"], "verified_backup_sha256": proof["sha256"]})
+        result = host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})
         self.assertTrue(result["all_verified"])
         self.assertFalse(self.claude_path.exists())
         self.assertTrue((self.archived / "projects/example" / (CLAUDE + ".jsonl")).exists())
         plan = host.make_plan({"operation": "unarchive", "selector": {"sessions": [CLAUDE], "tool": "claude"}})
         self.assertTrue(host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})["all_verified"])
         plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CLAUDE], "tool": "claude"}})
-        self.assertIsNone(plan["backup_sha256"])
+        self.assertNotIn("backup_sha256", plan)
         self.assertTrue(host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})["all_verified"])
         self.assertFalse(self.claude_path.exists())
         self.assertFalse(self.tool_output.exists())
         self.assertTrue(Path(proof["path"]).exists())
 
-    def test_stale_backup_and_unbacked_children_are_rejected(self):
-        proof = self.make_backup({"sessions": [PARENT], "tool": "codex"})
-        request = {"operation": "archive", "selector": {"sessions": [PARENT], "tool": "codex"},
-                   "backup_sha256": proof["sha256"], "backup_path": proof["path"], "backup_proof": proof["manifest"]}
-        request["backup_proof"] = {**proof["manifest"], "sessions": [row for row in proof["manifest"]["sessions"] if row["id"] != CHILD]}
-        with self.assertRaises(ValueError):
-            host.make_plan(request)
-        request["backup_proof"] = proof["manifest"]
-        with self.payloads[CHILD].open("a") as handle:
-            handle.write('{"changed":true}\n')
-        os.utime(self.payloads[CHILD], (self.age, self.age))
-        with self.assertRaises(ValueError):
-            host.make_plan(request)
+    def test_archive_plan_includes_descendants_without_a_backup(self):
+        plan = host.make_plan({"operation": "archive", "selector": {"sessions": [PARENT], "tool": "codex"}})
+        self.assertEqual({row["id"] for row in plan["sessions"]}, {PARENT, CHILD})
+        self.assertNotIn("backup_sha256", plan)
+        self.assertTrue(plan["items"])
 
     def test_changed_files_and_wrong_confirmation_cannot_apply(self):
         plan = host.make_plan({"operation": "delete", "selector": {"sessions": [CLAUDE]}})
+        archive_plan = host.make_plan({"operation": "archive", "selector": {"sessions": [CLAUDE]}})
         with self.assertRaises(ValueError):
             host.apply_plan({"plan": plan, "confirm": "wrong"})
         self.claude_path.write_text("changed")
         with self.assertRaises(RuntimeError):
             host.apply_plan({"plan": plan, "confirm": plan["plan_id"]})
+        with self.assertRaises(RuntimeError):
+            host.apply_plan({"plan": archive_plan, "confirm": archive_plan["plan_id"]})
         self.assertTrue(self.claude_path.exists())
 
     def test_codex_metadata_only_record_is_deleted_through_native_cli(self):
@@ -302,6 +296,80 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertFalse(self.claude_path.exists())
         self.assertTrue(destination.exists())
+
+    def test_progress_backup_preserves_zip_bytes_and_reports_copy_and_verification(self):
+        destination = self.base / "live-backup.zip"
+        messages = []
+        receipt = client.stream_backup("local", {"sessions": [CLAUDE], "tool": "claude"}, destination,
+                                       progress=lambda machine, tool, message: messages.append(message))
+        self.assertTrue(receipt["verified"])
+        self.assertTrue(any("Reading " in message for message in messages))
+        self.assertTrue(any("Verifying " in message for message in messages))
+        self.assertTrue(any("Backup verified:" in message for message in messages))
+        proof = client.verify_backup(destination)
+        entry = next(item for item in proof["manifest"]["files"] if item["kind"] == "transcript")
+        with zipfile.ZipFile(destination) as archive:
+            self.assertEqual(archive.read(entry["name"]), self.claude_path.read_bytes())
+
+    def test_progress_is_delivered_before_the_host_finishes(self):
+        acknowledgement = self.base / "acknowledged"
+        engine = self.base / "stream-engine.py"
+        engine.write_text("import json, sys, time\nfrom pathlib import Path\n"
+                          "print('AGENT_MAINTENANCE_EVENT '+json.dumps({'tool':'codex','message':'First output'}), file=sys.stderr, flush=True)\n"
+                          "deadline=time.monotonic()+3\n"
+                          "while not Path(" + repr(str(acknowledgement)) + ").exists():\n"
+                          "    if time.monotonic()>deadline: raise RuntimeError('Progress was buffered')\n"
+                          "    time.sleep(0.01)\n"
+                          "print('AGENT_MAINTENANCE_JSON '+json.dumps({'ok':True,'result':{'delivered':True}}), flush=True)\n")
+        messages = []
+        def receive(machine, tool, message):
+            messages.append((machine, tool, message))
+            acknowledgement.touch()
+        with mock.patch.object(client, "ENGINE", engine):
+            result = client.invoke("local", {"action": "versions"}, timeout=5, progress=receive)
+        self.assertEqual(result, {"delivered": True})
+        self.assertIn(("local", "codex", "First output"), messages)
+
+    def test_native_command_streams_both_channels_before_exit(self):
+        acknowledgement = self.base / "native-output-seen"
+        program = self.base / "native-output.py"
+        program.write_text("import sys, time\nfrom pathlib import Path\n"
+                           "print('Native first line', flush=True)\n"
+                           "deadline=time.monotonic()+3\n"
+                           "while not Path(" + repr(str(acknowledgement)) + ").exists():\n"
+                           "    if time.monotonic()>deadline: raise RuntimeError('Native output was buffered')\n"
+                           "    time.sleep(0.01)\n"
+                           "sys.stderr.write('Native stderr line\\n'); sys.stderr.flush()\n"
+                           "sys.stdout.write('x'*131072+'\\nNative completed\\n'); sys.stdout.flush()\n")
+        messages = []
+        def receive(tool, message):
+            messages.append(message)
+            if "Native first line" in "".join(messages):
+                acknowledgement.touch()
+        result = host.run_cli([sys.executable, str(program)], "codex", progress=receive, timeout=5, check=True)
+        self.assertIn("Native stderr line", "".join(messages))
+        self.assertIn("Native completed", result.stdout)
+        self.assertLessEqual(len(result.stdout.encode()), 6000)
+
+    def test_streaming_process_timeout_terminates_the_child(self):
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            host.stream_process([sys.executable, "-c", "import time; time.sleep(10)"], timeout=0.15)
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_progress_archive_keeps_stdout_json_and_needs_no_backup(self):
+        plan_path = self.base / "archive-without-backup.json"
+        output, progress = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(progress):
+            status = client.main(["plan", "archive", "--host", "local", "--tool", "claude", "--session", CLAUDE,
+                                  "--output", str(plan_path), "--json", "--progress"])
+        self.assertEqual(status, 0)
+        plan = json.loads(output.getvalue())["plan"]
+        self.assertIn("[local/claude]", progress.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(client.main(["apply", str(plan_path), "--confirm", plan["plan_id"], "--json", "--progress"]), 0)
+        self.assertFalse(self.claude_path.exists())
+        self.assertTrue((self.archived / "projects/example" / (CLAUDE + ".jsonl")).exists())
 
     def test_upgrades_default_to_preferred_servers_and_can_explicitly_target_local(self):
         aliases = "thor,loki,freya,bordeaux,champagne,zoran"

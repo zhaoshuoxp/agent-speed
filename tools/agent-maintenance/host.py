@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Host-side maintenance engine. Read-only actions are the default."""
 import base64
+import codecs
 import contextlib
 import datetime
 import hashlib
@@ -10,21 +11,110 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
+import signal
 import sqlite3
 import ssl
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zipfile
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 RECENT_SECONDS = 300
+
+
+def emit_progress(tool, message):
+    event = json.dumps({"tool": tool, "message": message}, ensure_ascii=True)
+    print("AGENT_MAINTENANCE_EVENT " + event, file=sys.stderr, flush=True)
+
+
+def stream_process(arguments, environment=None, input_data=None, timeout=120, output=None,
+                   stdout_limit=None, stderr_limit=65536, merge_stderr=False):
+    process = subprocess.Popen(arguments, stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                               env=environment, start_new_session=True)
+    writer = None
+    if input_data is not None:
+        def write_input():
+            try:
+                process.stdin.write(input_data)
+                process.stdin.flush()
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+        writer = threading.Thread(target=write_input, daemon=True)
+        writer.start()
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
+    for name in buffers:
+        stream = getattr(process, name)
+        if stream is not None:
+            selector.register(stream, selectors.EVENT_READ, name)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            for key, _ in selector.select(min(0.2, remaining)):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                name = key.data
+                if output is not None:
+                    output(name, chunk)
+                buffers[name].extend(chunk)
+                limit = limits[name]
+                if limit is not None and len(buffers[name]) > limit:
+                    del buffers[name][:len(buffers[name]) - limit]
+        status = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        return subprocess.CompletedProcess(arguments, status, stdout=bytes(buffers["stdout"]), stderr=bytes(buffers["stderr"]))
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        if writer is not None:
+            writer.join(timeout=1)
+
+
+def run_cli(arguments, tool, progress=None, environment=None, timeout=120, check=False):
+    if progress is None:
+        return subprocess.run(arguments, env=environment, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, check=check)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    def forward(name, chunk):
+        text = decoder.decode(chunk)
+        if text:
+            progress(tool, text)
+    result = stream_process(arguments, environment=environment, timeout=timeout, output=forward,
+                            stdout_limit=6000, merge_stderr=True)
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        progress(tool, tail)
+    result.stdout = result.stdout.decode(errors="replace")
+    result.stderr = ""
+    if check:
+        result.check_returncode()
+    return result
 
 
 def roots():
@@ -77,14 +167,6 @@ def identity(path):
 def fingerprint(path):
     value = identity(path)
     return {key: value[key] for key in ("size", "modified_ns", "device", "inode")}
-
-
-def file_hash(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def timestamp(value):
@@ -311,9 +393,18 @@ def find_cli(tool):
     return next((path for path in candidates if path and Path(path).is_file() and os.access(path, os.X_OK)), None)
 
 
-def inventory(include_storage=False):
+def inventory(include_storage=False, progress=None):
+    if progress:
+        progress("codex", "Scanning conversations")
     codex, errors = scan_codex()
+    if progress:
+        progress("codex", "Found " + str(len(codex)) + " records")
+        progress("claude", "Scanning conversations")
     claude, more = scan_claude()
+    if progress:
+        progress("claude", "Found " + str(len(claude)) + " records")
+        if include_storage:
+            progress("", "Measuring storage directories")
     records = codex + claude
     index = {(row["tool"], row["id"]): row for row in records}
     for row in records:
@@ -432,7 +523,7 @@ def zip_member(archive, name, blocks, manifest, kind, **metadata):
     manifest["files"].append({"name": name, "kind": kind, "size": count, "sha256": digest.hexdigest(), **metadata})
 
 
-def file_blocks(path, expected, references):
+def file_blocks(path, expected, references, progress=None, tool=""):
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
@@ -440,7 +531,9 @@ def file_blocks(path, expected, references):
                   "device": info.st_dev, "inode": info.st_ino}
         if expected != actual:
             raise RuntimeError("A selected file changed before backup: " + str(path))
-        remaining, carry = info.st_size, b""
+        remaining, carry, last_report = info.st_size, b"", time.monotonic()
+        if progress:
+            progress(tool, "Reading " + str(path) + " (" + str(remaining) + " bytes)")
         while remaining:
             block = handle.read(min(1 << 20, remaining))
             if not block:
@@ -450,6 +543,9 @@ def file_blocks(path, expected, references):
                 references.add((match.group(1).decode(), match.group(2).decode()))
             carry = probe[-512:]
             remaining -= len(block)
+            if progress and (not remaining or time.monotonic() - last_report >= 1):
+                progress(tool, str(path.name) + ": " + str(info.st_size - remaining) + "/" + str(info.st_size) + " bytes")
+                last_report = time.monotonic()
             yield block
         info = os.fstat(handle.fileno())
         if (info.st_size, info.st_mtime_ns) != (expected["size"], expected["modified_ns"]):
@@ -532,10 +628,10 @@ def database_members(archive, rows, manifest):
                        [json.dumps(schemas, ensure_ascii=True)], manifest, "database-schema")
 
 
-def backup(selector, output):
+def backup(selector, output, progress=None):
     if not (selector.get("sessions") or selector.get("project") or selector.get("all")):
         raise ValueError("Choose a project, session IDs, or an explicit all-sessions selection")
-    data = inventory()
+    data = inventory(progress=progress)
     rows = selected_sessions(data, selector)
     if not rows:
         raise ValueError("No conversations match the selection")
@@ -548,15 +644,19 @@ def backup(selector, output):
     written, references = set(), set()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
         for row in rows:
+            if progress:
+                progress(row["tool"], "Backing up conversation " + row["id"])
             for path in session_files(row):
                 name = "files/" + ("codex" if row["tool"] == "codex" else "claude-archive" if row["archived"] else "claude") + "/" + path.relative_to(row["base"]).as_posix()
                 if name in written:
                     continue
                 written.add(name)
                 before = fingerprint(path)
-                zip_member(archive, name, file_blocks(path, before, references), manifest,
+                zip_member(archive, name, file_blocks(path, before, references, progress, row["tool"]), manifest,
                            "transcript" if str(path) == row["path"] else "session-file",
                            owner_id=row["id"], tool=row["tool"], source_path=str(path), identity=before)
+            if progress:
+                progress(row["tool"], "Generating readable export for " + row["id"])
             zip_member(archive, "readable/" + row["tool"] + "-" + row["id"] + ".html",
                        readable_blocks(row), manifest, "readable-export", owner_id=row["id"], tool=row["tool"])
         root = roots()["codex"]
@@ -569,10 +669,14 @@ def backup(selector, output):
                     continue
                 written.add(name)
                 before = fingerprint(path)
-                zip_member(archive, name, file_blocks(path, before, set()), manifest, "referenced-media",
+                zip_member(archive, name, file_blocks(path, before, set(), progress, "codex"), manifest, "referenced-media",
                            source_path=str(path), identity=before, tool="codex")
+        if progress:
+            progress("", "Exporting conversation database rows")
         database_members(archive, rows, manifest)
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=True, indent=2))
+    if progress:
+        progress("", "Backup stream completed: " + str(len(rows)) + " records")
 
 
 def cleanup_files(categories, days, selected_tool="all"):
@@ -606,13 +710,14 @@ def plan_digest(plan):
                                      sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
 
 
-def make_plan(request):
+def make_plan(request, progress=None):
     operation = request["operation"]
     if operation not in ("archive", "unarchive", "delete", "cleanup"):
         raise ValueError("Unsupported maintenance operation")
     result = {"format": "agent-maintenance-plan", "format_version": 1, "created_at": time.time(),
-              "machine_id": machine_id(), "operation": operation, "items": [], "sessions": [],
-              "backup_sha256": request.get("backup_sha256"), "backup_path": request.get("backup_path")}
+              "machine_id": machine_id(), "operation": operation, "items": [], "sessions": []}
+    if progress:
+        progress("", "Preparing " + operation + " preview")
     if operation == "cleanup":
         result["categories"] = request.get("categories") or ["logs", "temp"]
         result["days"] = int(request.get("days", 30))
@@ -622,40 +727,32 @@ def make_plan(request):
         selector = request["selector"]
         if not (selector.get("sessions") or selector.get("project") or selector.get("all")):
             raise ValueError("Choose project or session IDs before changing conversations")
-        data = inventory()
+        data = inventory(progress=progress)
         rows = selected_sessions(data, selector)
         if not rows:
             raise ValueError("No conversations match the selection")
         active = [row["id"] for row in rows if row["busy"]]
         if active:
             raise RuntimeError("Selected conversations are active or recently changed: " + ", ".join(active))
-        proof = request.get("backup_proof") or {}
-        covered = {(item["tool"], item["id"]) for item in proof.get("sessions", [])}
-        if operation == "archive":
-            if not result["backup_sha256"] or not all((row["tool"], row["id"]) in covered for row in rows):
-                raise ValueError("A verified backup covering every selected conversation and child is required")
-        backed_hashes = {}
-        for item in proof.get("files", []):
-            if item.get("owner_id"):
-                backed_hashes.setdefault((item.get("tool"), item["owner_id"]), set()).add(item["sha256"])
         for row in rows:
+            if progress:
+                progress(row["tool"], "Selected " + row["id"] + " for " + operation)
             result["sessions"].append(row)
             for path in session_files(row):
                 value = fingerprint(path)
-                digest = file_hash(path) if operation == "archive" else None
                 if fingerprint(path) != value:
                     raise RuntimeError("A session file changed while preparing the plan")
-                if operation == "archive" and digest not in backed_hashes.get((row["tool"], row["id"]), set()):
-                    raise ValueError("The backup is missing a file or predates its current content: " + str(path))
                 result["items"].append({"path": str(path), "tool": row["tool"], "owner_id": row["id"],
-                                        "sha256": digest, **identity(path)})
+                                        **identity(path)})
     result["bytes"] = sum(item["size"] for item in result["items"])
     result["disk_bytes"] = sum(item["disk_bytes"] for item in result["items"])
     result["plan_id"] = plan_digest(result)
+    if progress:
+        progress("", "Preview ready: " + str(len(result["sessions"])) + " records, " + str(len(result["items"])) + " files")
     return result
 
 
-def apply_plan(request):
+def apply_plan(request, progress=None):
     plan = request["plan"]
     if plan.get("plan_id") != plan_digest(plan) or request.get("confirm") != plan["plan_id"]:
         raise ValueError("The exact plan ID is required and the plan must be unchanged")
@@ -664,24 +761,24 @@ def apply_plan(request):
     if time.time() - plan["created_at"] > 86400:
         raise ValueError("This plan has expired; prepare a fresh preview")
     operation = plan["operation"]
+    if progress:
+        progress("", "Applying " + operation + " plan")
     if operation not in ("archive", "unarchive", "delete", "cleanup"):
         raise ValueError("Unsupported maintenance operation")
     for item in plan["items"]:
         current = fingerprint(item["path"])
         if any(current[key] != item[key] for key in current):
             raise RuntimeError("A planned file changed; no operation was performed: " + item["path"])
-        if item.get("sha256") and file_hash(item["path"]) != item["sha256"]:
-            raise RuntimeError("A planned file no longer matches the verified backup")
     if operation == "cleanup":
         allowed = {item["path"] for item in cleanup_files(plan["categories"], plan["days"], plan.get("tool", "all"))}
         if any(item["path"] not in allowed for item in plan["items"]):
             raise RuntimeError("A cleanup file is outside the current eligible scope")
         for item in plan["items"]:
             Path(item["path"]).unlink()
+            if progress:
+                progress(item["tool"], "Removed " + item["path"])
         return {"operation": operation, "removed_files": len(plan["items"]), "bytes": plan["bytes"]}
-    if operation == "archive" and request.get("verified_backup_sha256") != plan.get("backup_sha256"):
-        raise ValueError("Reverify the exact backup before applying this plan")
-    current = inventory()
+    current = inventory(progress=progress)
     by_id = {(row["tool"], row["id"]): row for row in current["sessions"]}
     for row in plan["sessions"]:
         actual = by_id.get((row["tool"], row["id"]))
@@ -690,6 +787,8 @@ def apply_plan(request):
     targets = plan["sessions"]
     results = []
     for row in targets:
+        if progress:
+            progress(row["tool"], operation.capitalize() + " conversation " + row["id"])
         if row["tool"] == "codex":
             if row.get("database"):
                 with contextlib.closing(connect(row["database"])) as db:
@@ -707,8 +806,7 @@ def apply_plan(request):
             if operation == "delete":
                 arguments.append("--force")
             environment = dict(os.environ, CODEX_HOME=row["base"])
-            response = subprocess.run(arguments, env=environment, stdin=subprocess.DEVNULL,
-                                      capture_output=True, text=True, timeout=120)
+            response = run_cli(arguments, "codex", progress, environment)
             if response.returncode:
                 results.append({"tool": "codex", "id": row["id"], "state": "error",
                                 "error": (response.stderr or response.stdout)[-2000:]})
@@ -719,6 +817,8 @@ def apply_plan(request):
             if operation == "delete":
                 for path in files:
                     path.unlink()
+                    if progress:
+                        progress("claude", "Deleted " + str(path))
             else:
                 destination = roots()["claude-archive" if operation == "archive" else "claude"]
                 pairs = [(path, destination / path.relative_to(source)) for path in files]
@@ -727,6 +827,8 @@ def apply_plan(request):
                 for original, target in pairs:
                     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     shutil.move(str(original), str(target))
+                    if progress:
+                        progress("claude", "Moved " + str(original) + " to " + str(target))
         results.append({"tool": row["tool"], "id": row["id"], "state": "applied"})
     after = inventory()
     remaining = {(row["tool"], row["id"]): row for row in after["sessions"]}
@@ -736,6 +838,8 @@ def apply_plan(request):
         actual = remaining.get((result["tool"], result["id"]))
         valid = not actual if operation == "delete" else actual and actual["archived"] == (operation == "archive")
         result["state"] = "verified" if valid else "needs_review"
+        if progress:
+            progress(result["tool"], result["id"] + ": " + result["state"])
     return {"operation": operation, "results": results,
             "all_verified": all(item["state"] == "verified" for item in results),
             "note": "Database files may retain free pages; archive changes organization without freeing transcript bytes."}
@@ -800,14 +904,18 @@ def latest_version(tool):
     return version
 
 
-def tool_versions(request):
+def tool_versions(request, progress=None):
     result = []
     for tool in ("codex", "claude") if request.get("tool", "all") == "all" else (request["tool"],):
         if tool not in ("codex", "claude"):
             raise ValueError("Unsupported CLI")
         item = {"tool": tool, "path": find_cli(tool), "state": "missing"}
         result.append(item)
+        if progress:
+            progress(tool, "Checking installed CLI")
         if not item["path"]:
+            if progress:
+                progress(tool, "Not installed on this host")
             continue
         try:
             response = subprocess.run([item["path"], "--version"], capture_output=True, text=True, timeout=20, check=True)
@@ -815,16 +923,23 @@ def tool_versions(request):
             if not match:
                 raise ValueError("Could not parse the installed version")
             item.update(installed=match.group(0), state="installed")
+            if progress:
+                progress(tool, "Installed version: " + item["installed"])
             bundled = ".app/Contents/" in item["path"]
             item["managed_by"] = "desktop app" if bundled else "native CLI"
             if request.get("check_latest") or request.get("apply"):
                 item["latest"] = latest_version(tool)
                 item["update_available"] = version_key(item["installed"]) < version_key(item["latest"])
+                if progress:
+                    progress(tool, "Release channel: " + item["latest"])
             if request.get("apply") and item["update_available"] and bundled:
                 item.update(state="app_managed", note="Update the desktop app to update this bundled CLI.")
+                if progress:
+                    progress(tool, item["note"])
             elif request.get("apply") and item["update_available"]:
-                response = subprocess.run([item["path"], "update"], stdin=subprocess.DEVNULL, capture_output=True,
-                                          text=True, timeout=900, check=True)
+                if progress:
+                    progress(tool, "Running native updater: " + item["path"] + " update")
+                response = run_cli([item["path"], "update"], tool, progress, timeout=900, check=True)
                 update_output = (response.stdout or "") + (response.stderr or "")
                 item["update_log"] = update_output[-6000:]
                 if tool == "codex" and "Could not safely inspect old Codex releases" in update_output:
@@ -834,29 +949,36 @@ def tool_versions(request):
                 if not match or version_key(match.group(0)) < version_key(item["latest"]):
                     raise RuntimeError("The updated CLI did not pass version verification")
                 item.update(installed=match.group(0), state="updated", update_available=False)
+                if progress:
+                    progress(tool, "Update verified: " + item["installed"])
+            elif request.get("apply") and progress:
+                progress(tool, "Up to date; update skipped")
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             detail = ""
             if isinstance(error, subprocess.CalledProcessError):
                 detail = (error.stderr or error.stdout or "")[-2000:]
             item.update(state="error", error=str(error) + (": " + detail if detail else ""))
+            if progress:
+                progress(tool, "Failed: " + item["error"])
     return {"tools": result}
 
 
 def dispatch(request, output=None):
     action = request.get("action", "inventory")
+    progress = emit_progress if request.get("progress") else None
     if action == "inventory":
-        return inventory(request.get("storage", False))
+        return inventory(request.get("storage", False), progress)
     if action == "diagnostics":
-        return inventory()["diagnostics"]
+        return inventory(progress=progress)["diagnostics"]
     if action == "backup":
-        backup(request["selector"], output or sys.stdout.buffer)
+        backup(request["selector"], output or sys.stdout.buffer, progress)
         return None
     if action == "plan":
-        return make_plan(request)
+        return make_plan(request, progress)
     if action == "apply":
-        return apply_plan(request)
+        return apply_plan(request, progress)
     if action == "versions":
-        return tool_versions(request)
+        return tool_versions(request, progress)
     raise ValueError("Unknown maintenance action: " + str(action))
 
 

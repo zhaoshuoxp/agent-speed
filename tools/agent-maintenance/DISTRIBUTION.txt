@@ -1,4 +1,4 @@
-Agent Maintenance 0.1.2 - Test Distribution
+Agent Maintenance 0.1.3 - Test Distribution
 
 INSTALL ON MACOS
 Quit older copies of Agent Maintenance, extract this complete ZIP, and double-click Install.command. You can also run bash Install.command from Terminal. The installer creates ~/Applications/Agent Maintenance.app and ~/.local/bin/agent-maintenance. Open that exact app path when several copies exist.
@@ -12,7 +12,7 @@ CHECK THE INSTALLATION
   ~/.local/bin/agent-maintenance hosts --json
   ~/.local/bin/agent-maintenance diagnose --host local --json
 
-Version output should be 0.1.2. A previous installation that stopped at the Python check did not create the CLI launcher; run this updated installer to create it.
+Version output should be 0.1.3. A previous installation that stopped at the Python check did not create the CLI launcher; run this updated installer to create it.
 
 SSH HOSTS
 Literal Host aliases are discovered from ~/.ssh/config and its Include files. Wildcard and negated patterns are excluded. Existing Agent Speed SSHUsage settings and explicit maintenance host selections take precedence. Select Sources & SSH in the app to review detected hosts, choose aliases, and save the selection. The new computer needs working SSH aliases and key or ssh-agent authentication; background requests cannot display password prompts. This package contains no private keys, login credentials, live SSH configuration, or conversation data.
@@ -25,7 +25,12 @@ The independent maintenance app cannot reuse Codex desktop's QR-paired Remote ch
 CODEX RECORDS
 The source summary shows actual data homes and record counts. Local Codex defaults to ~/.codex. Guardian records whose parent conversation is absent remain visible. Include subagents shows every record, and the Kind column identifies subagents. A store containing guardian records only is labeled explicitly. Sources & SSH also allows choosing another local Codex or Claude data home.
 
-Start testing with browsing and backups. Delete requests a final confirmation and uses your manual backup policy; no backup chooser or backup verification is required. Archive requires a verified backup and a reviewed plan. restore-files extracts standalone originals and database row exports; native desktop sidebar import from a deleted-conversation backup is not implemented. The source Mac remained locked during development, so visual UI acceptance is still pending. The packaged app is checked through its native runtime using Python 3.9 and an isolated 40-guardian fixture.
+Archive and delete request confirmation and use your manual backup policy; neither opens a backup chooser nor requires backup verification. Codex archive uses the native CLI. Claude File archive moves session bundles to ~/.claude-archive and supports moving them back; it does not call Claude Desktop's native Archive. Scanning and backups work without installed agent CLIs; Codex native actions require Codex on the host storing the conversations. restore-files extracts standalone originals and database row exports; native desktop sidebar import from a deleted-conversation backup is not implemented.
+
+OPERATION LOGS AND DIAGNOSTICS
+The main operation log shows live output while commands run and appends timestamped results. Completed summaries are saved in ~/Library/Application Support/AgentMaintenance/operations.log with a bounded history. Clear records removes the saved history and current display. Live output is kept in memory. The Remote CLI maintenance panel has its own live log, which is not saved and clears when the panel closes. Diagnostics contains the configuration JSON and source details.
+
+The source Mac remained locked during development, so visual UI acceptance is still pending. The packaged app is checked through its native runtime using Python 3.9, an isolated 40-guardian fixture, a live pipe handshake, and operation-record save/clear checks.
 
 CLI ON MACOS OR LINUX
   python3 cli/install.py

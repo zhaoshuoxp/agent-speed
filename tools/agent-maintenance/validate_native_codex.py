@@ -86,8 +86,6 @@ def main():
             outcomes = []
             for operation in ("archive", "unarchive", "delete"):
                 request = {"operation": operation, "selector": {"sessions": [sid], "tool": "codex"}}
-                if operation == "archive":
-                    request.update(backup_proof=proof["manifest"], backup_sha256=proof["sha256"], backup_path=proof["path"])
                 # Native archive state updates are also aged within the fixture before the next action.
                 if operation != "archive":
                     with contextlib.closing(sqlite3.connect(database)) as db:
@@ -97,8 +95,6 @@ def main():
                     os.utime(current_path, (old, old))
                 plan = host.make_plan(request)
                 apply_request = {"plan": plan, "confirm": plan["plan_id"]}
-                if operation == "archive":
-                    apply_request["verified_backup_sha256"] = proof["sha256"]
                 result = host.apply_plan(apply_request)
                 outcomes.append({"operation": operation, "verified": result["all_verified"], "results": result["results"]})
                 print(json.dumps(outcomes[-1]), flush=True)

@@ -45,9 +45,19 @@ with tempfile.TemporaryDirectory(prefix="maintenance-app-check-") as temporary:
     conversation.write_text(json.dumps({"type": "user", "cwd": str(root), "message": {"content": "Fixture"}}) + "\n")
     configuration = root / "config.json"
     configuration.write_text(json.dumps({"hosts": ["thor", "loki", "freya", "bordeaux", "champagne"]}))
+    stream_script = root / "stream-fixture.py"
+    acknowledgement = Path(str(stream_script) + ".ack")
+    stream_script.write_text("import json, sys, time\nfrom pathlib import Path\n"
+                             "print('Stream fixture started', file=sys.stderr, flush=True)\n"
+                             "deadline=time.monotonic()+5\n"
+                             "while not Path(" + repr(str(acknowledgement)) + ").exists():\n"
+                             "    if time.monotonic()>deadline: raise RuntimeError('App buffered stderr')\n"
+                             "    time.sleep(0.01)\n"
+                             "print(json.dumps({'stream_completed':True,'payload':'x'*131072}), flush=True)\n"
+                             "print('Fixture finished\\n'*8192, file=sys.stderr, flush=True)\n")
     environment = dict(os.environ, AGENT_MAINTENANCE_CONFIG=str(configuration), CODEX_HOME=str(codex),
                        CLAUDE_CONFIG_DIR=str(claude), CLAUDE_ARCHIVE_DIR=str(root / "claude-archive"),
-                       AGENT_MAINTENANCE_PYTHON=args.python)
+                       AGENT_MAINTENANCE_PYTHON=args.python, AGENT_MAINTENANCE_SELF_CHECK_SCRIPT=str(stream_script))
     environment.pop("AGENT_MAINTENANCE_HOSTS", None)
     response = subprocess.run([str(app / "Contents/MacOS/AgentMaintenance"), "--self-check"], env=environment,
                               capture_output=True, text=True, timeout=45)
@@ -64,6 +74,9 @@ with tempfile.TemporaryDirectory(prefix="maintenance-app-check-") as temporary:
     assert report["codex"]["subagent_records"] == 40, report
     assert report["claude"]["total_records"] == 1, report
     assert report["iconBundled"], report
+    assert report["operation_records"] == "save and clear passed", report
+    assert report["live_output"] == "delivered before process exit", report
     print(json.dumps({"app_version": info["CFBundleShortVersionString"], "python": report["python"],
                       "hosts": len(report["hosts"]), "upgrade_targets": len(targets), "codex_records": 40, "default_visible_codex": 27,
-                      "claude_records": 1, "icon_bundled": True, "signature": "passed", "self_check": "passed"}, indent=2))
+                      "claude_records": 1, "icon_bundled": True, "signature": "passed", "self_check": "passed",
+                      "live_output": report["live_output"], "operation_records": report["operation_records"]}, indent=2))
